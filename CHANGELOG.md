@@ -1,5 +1,46 @@
 # Changelog
 
+## Stale offline presence handling - 2026-08-11
+
+- **Stopped characters no longer blocked by stale labels** - Offline database actions now accept a raw `LoggingOut` or other stale status when `server_id` is null or has no matching row in `active_server_ids`. This matches the game's effective-offline behaviour after a hard battlegroup or VM stop.
+- **Active sessions remain blocked** - The existing strict stopped-battlegroup parse is unchanged. Guarded offline workflows require exactly one player-state row and a valid controller during preflight, then lock that row and repeat the same active-server predicate inside their transaction. Missing, ambiguous, or non-offline state attached to an active server still fails closed; `farm_state` is not used for offline safety.
+
+## Bulk online augment grant — 2026-08-11
+
+- **One of every confirmed augment** — Added an Online Actions button that queues exactly one native `AddItemToInventory` grant for each of the 105 metadata-confirmed augment templates while the selected character is fully online.
+- **Strict reviewed boundary** — The backend derives the batch only from the augment catalog, requires exactly 105 unique non-package-only IDs, fixes quantity and durability to 1, and excludes all 22 package-only experimental candidates. Those remain available only as individual warned grants.
+- **Safe bulk delivery** — Reuses the per-character action lock, online identity checks, base64/SSH RabbitMQ publisher, ~300 ms pacing, and exact broker receipt. Ambiguous delivery is never retried automatically, and the UI reports queued/broker accepted rather than claiming the game applied the items.
+
+## Reviewed augment creation — 2026-08-11
+
+- **Expanded augment catalog** — Added 105 grantable base templates from game-derived item metadata and checked them against the installed July 23 `Systems.pak`. The 14 former `T6_Augment_Ch5_*` entries use their current `T6_Augment_B1C4_*` identifiers. A further 22 Polar-cap/cold/volume IDs found as current 1.4 item-name candidates are included as clearly marked package-only experiments with an additional confirmation. Recipe/schematic, asset-only, partial, and typo strings remain excluded. Online augment grants are fixed to quantity 1, bringing the merged picker to 1,127 entries.
+- **Three offline-reviewed templates** — `T6_Augment_Damage1` (Heavy Caliber Upgrade), `T6_Augment_Damage2` (House Heavy Caliber Upgrade), and `T6_Augment_Range1` (Barrel Extender) remain the only guarded offline creation choices because their standalone shapes have database evidence.
+- **Dedicated offline creation** — The three augments now appear as special **Create Offline** rows in Add Item. The backend accepts only the exact allowlist and quantity 1, requires a stopped battlegroup and Offline character before and after a verified backup, targets exactly one pawn-owned Backpack, locks and validates its rows and positions, inserts into the lowest free slot, and performs an exact readback before commit. The generic raw Add Item route still rejects augments.
+- **Reviewed shape boundary** — Heavy Caliber Upgrade uses a loose-item seed observed in the database. House Heavy Caliber Upgrade and Barrel Extender use reviewed installed-item-derived seeds and are clearly marked experimental; native Online Actions grant remains preferred. House Heavy Caliber Upgrade is marked non-gradeable in local game-derived metadata, so forced Grade 5 requires in-game verification.
+- **Effects documented** — Added the reviewed damage/range grade bands to the Characters documentation and player-facing catalog names/effect summaries.
+
+## Augment attributes — 2026-08-10
+
+- **Per-item augment action** — Eligible standalone augment rows now show grade, positive numeric roll count, and a **Max + Grade 5** button. The action sets positive numeric `FAugmentItemStats.StatRolls` values to `1.003398`, preserves non-positive and non-numeric entries, and sets `quality_level` to 5.
+- **Selected-character Max All** — The bulk action now applies the same roll and Grade 5 changes only to supported standalone augment templates in the selected character's owned inventories. It does not use hard-coded inventory IDs or touch world-wide rows.
+- **Transaction safety** — Per-item changes preflight exact ownership and eligibility before creating a backup, then require a fully stopped battlegroup and Offline character again after backup. The transaction locks the exact item and inventory, rechecks ownership/template/JSON shape, and verifies exact rolls, grade, and affected row counts before commit. Bulk changes use the same stopped/offline, pawn-scope, lock, and readback rules.
+- **Installed augment boundary** — Augments already installed into equipment move to `FAugmentedItemStats` and are intentionally excluded from this standalone-item workflow pending a separate slot-aware editor.
+
+## Online actions — 2026-08-09
+
+- **Native live actions** — Added allowlisted XP, skill-point, reviewed skill-module, reviewed item, and safe training-script actions through the game's Version 2 notification channel. Targets must be fully Online and attached to a game server. Broker acceptance is reported as queued, not as proof the client applied it.
+- **Live Solari delivery** — Online Solari now sends the fixed, game-native `SolarisCoin` item through `AddItemToInventory`. The previous virtual-wallet database function updated PostgreSQL but did not notify an already-running game session, so the client could show no change until later reconciliation.
+- **Reliable bulk training** — Replaced the retail-incompatible bulk `CheatScript` calls with fixed server-built batches of native XP and module-level commands. The manager sends them about 300 ms apart in one broker operation, verifies the exact queued count, excludes Hidden modules and `Skills.Ability.VoiceStop`, and never automatically retries an ambiguous result.
+- **Web security** — The manager now listens only on `127.0.0.1` and rejects non-local HTTP and WebSocket hosts.
+
+## Local safety repair — 2026-08-09
+
+- **Tech tree** — Removed the unsafe 356-node pak-catalog injection. Unlock All now marks only game-created save entries as purchased, preserves the separate known-recipes collection, caps Intel at 2,779, requires the battlegroup stopped/player offline, and creates a backup first.
+- **Specializations** — Uses `player_controller_id`, validates the real XP/level range, and adds a backup-first Max All action (44,182 XP, level 100, all 205 keystones). It also removes junk rows written under the pawn ID by older versions.
+- **Cosmetics** — Replaced pak-string guesses with 391 customization IDs observed in live persisted player data. Add/remove is catalog-confined and idempotent; bulk unlock preserves existing entries and creates a backup first.
+- **Database writes** — PostgreSQL mutations now stop on the first SQL error instead of continuing after a failed statement.
+- **Offline currency editor** — Solari and House Scrip balance changes now enforce the stopped/offline contract on the server, create a safety backup, lock and recheck the player, validate bounded currency values, and verify the committed balance.
+
 ## 1.0.7 — 2026-06-02
 
 ### SSH — fix false "SSH exited with code 1" on battlegroup commands

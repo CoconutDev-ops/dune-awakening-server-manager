@@ -20,6 +20,8 @@
   const consoleBadge  = $('#console-badge');
   const overlay       = $('#overlay');
   const overlayText   = $('#overlay-text');
+  const operationConsoleOut = $('#operation-console-output');
+  const operationConsoleScroll = $('#operation-console-scroll');
   const linkFB        = $('#link-filebrowser');
   const linkDir       = $('#link-director');
   const monFB         = $('#mon-filebrowser');
@@ -34,13 +36,92 @@
   // -----------------------------------------------------------------------
   // Tabs
   // -----------------------------------------------------------------------
+  const SETUP_DISMISSED_KEY = 'duneServerManager.setupDismissed';
+  const setupNavTab = $('#setup-nav-tab');
+  const setupNavLabel = $('#setup-nav-label');
+  const showSetupButton = $('#btn-show-setup');
+  const charactersNavTab = $('#characters-nav-tab');
+  const characterSubnav = $('#character-subnav');
+  const characterViewButtons = $$('.character-subnav-item');
+
+  // Keep the data-heavy tools in dedicated workspaces without changing any
+  // action IDs or event targets used by the character editor below.
+  $('#character-inventory-mount').append(
+    $('#character-inventory-card'),
+    $('#character-augment-card')
+  );
+  $('#character-cheats-mount').append($('#character-cheats-card'));
+
+  function switchCharacterView(view) {
+    if (!view || !charData) return;
+
+    $$('[data-character-view-panel]').forEach((panel) => {
+      const active = panel.dataset.characterViewPanel === view;
+      panel.hidden = !active;
+      panel.classList.toggle('active', active);
+    });
+
+    characterViewButtons.forEach((button) => {
+      const active = button.dataset.characterView === view;
+      const isOfflineParent = button.classList.contains('character-subnav-parent');
+      button.classList.toggle('active', active || (isOfflineParent && view.startsWith('offline-')));
+      if (active && !isOfflineParent) button.setAttribute('aria-current', 'page');
+      else button.removeAttribute('aria-current');
+    });
+
+    const content = $('.content');
+    if (content) content.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  function setCharacterWorkspaceAvailable(available) {
+    characterViewButtons.forEach((button) => { button.disabled = !available; });
+  }
+
+  characterViewButtons.forEach((button) => {
+    button.addEventListener('click', () => switchCharacterView(button.dataset.characterView));
+  });
+
+  function setupIsDismissed() {
+    try {
+      return localStorage.getItem(SETUP_DISMISSED_KEY) === 'true';
+    } catch {
+      return false;
+    }
+  }
+
+  function setSetupDismissed(dismissed) {
+    try {
+      if (dismissed) localStorage.setItem(SETUP_DISMISSED_KEY, 'true');
+      else localStorage.removeItem(SETUP_DISMISSED_KEY);
+    } catch { /* Keep the control usable when storage is unavailable. */ }
+
+    setupNavTab.hidden = dismissed;
+    setupNavLabel.hidden = dismissed;
+    showSetupButton.hidden = !dismissed;
+  }
+
+  setSetupDismissed(setupIsDismissed());
+
   $$('.tab').forEach((tab) => {
     tab.addEventListener('click', () => {
       $$('.tab').forEach((t) => t.classList.remove('active'));
       $$('.panel').forEach((p) => p.classList.remove('active'));
       tab.classList.add('active');
       $(`#tab-${tab.dataset.tab}`).classList.add('active');
+      const charactersActive = tab.dataset.tab === 'characters';
+      characterSubnav.hidden = !charactersActive;
+      charactersNavTab.setAttribute('aria-expanded', String(charactersActive));
     });
+  });
+
+  $('#btn-dismiss-setup').addEventListener('click', () => {
+    setSetupDismissed(true);
+    document.querySelector('.tab[data-tab="dashboard"]').click();
+  });
+
+  showSetupButton.addEventListener('click', () => {
+    setSetupDismissed(false);
+    setupNavTab.click();
   });
 
   // -----------------------------------------------------------------------
@@ -56,6 +137,18 @@
   function appendConsole(text) {
     consoleOut.textContent += text;
     consoleOut.parentElement.scrollTop = consoleOut.parentElement.scrollHeight;
+
+    // The full-screen operation console follows the same output stream as the
+    // persistent console, but only retains output from the current operation.
+    if (!overlay.hidden) {
+      if (!operationHasOutput) {
+        operationConsoleOut.textContent = '';
+        operationHasOutput = true;
+      }
+      operationConsoleOut.textContent += text;
+      operationConsoleScroll.scrollTop = operationConsoleScroll.scrollHeight;
+    }
+
     if (consoleWrap.classList.contains('collapsed')) {
       consoleBadge.hidden = false;
     }
@@ -130,15 +223,42 @@
     return data;
   }
 
+  const operationLockTargets = [$('.topbar'), $('.tabs'), $('.content'), consoleWrap];
+  let operationPreviousFocus = null;
+  let operationDepth = 0;
+  let operationHasOutput = false;
+
   function showOverlay(text) {
+    operationDepth += 1;
+    if (operationDepth > 1) return;
+
     overlayText.textContent = text;
+    operationHasOutput = false;
+    operationConsoleOut.textContent = 'Waiting for server output...\n';
+    operationConsoleScroll.scrollTop = 0;
+    operationPreviousFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    operationLockTargets.forEach((element) => { element.inert = true; });
+    document.body.classList.add('operation-active');
     overlay.hidden = false;
     busy = true;
+    requestAnimationFrame(() => overlay.focus({ preventScroll: true }));
   }
 
   function hideOverlay() {
+    if (operationDepth === 0) return;
+    operationDepth -= 1;
+    if (operationDepth > 0) return;
+
     overlay.hidden = true;
+    document.body.classList.remove('operation-active');
+    operationLockTargets.forEach((element) => { element.inert = false; });
     busy = false;
+    if (operationPreviousFocus && operationPreviousFocus.isConnected) {
+      operationPreviousFocus.focus({ preventScroll: true });
+    }
+    operationPreviousFocus = null;
   }
 
   async function runAction(path, label, body) {
@@ -1044,20 +1164,106 @@
   let itemCatalog = null;
   let catalogArr = [];
   let charData = null;
+  let onlineActionCatalog = null;
 
   async function loadItemCatalog() {
     if (itemCatalog) return;
     try {
-      const resp = await fetch('/data/item-catalog.json');
-      const data = await resp.json();
-      itemCatalog = data.items;
+      const [itemResp, augmentResp] = await Promise.all([
+        fetch('/data/item-catalog.json'),
+        fetch('/data/augment-catalog.json'),
+      ]);
+      if (!itemResp.ok || !augmentResp.ok) throw new Error('A reviewed item catalog could not be loaded.');
+      const [data, augmentData] = await Promise.all([itemResp.json(), augmentResp.json()]);
+      itemCatalog = { ...(data.items || {}), ...(augmentData.items || {}) };
       catalogArr = Object.entries(itemCatalog).map(([tid, info]) => ({
-        tid, name: info.name, category: info.category,
+        tid,
+        name: info.name,
+        category: info.category,
+        effect: info.effect || '',
+        offlineCreatable: info.offlineCreatable === true,
+        offlineExperimental: info.offlineExperimental === true,
+        packageOnly: info.packageOnly === true,
       }));
       catalogArr.sort((a, b) => a.name.localeCompare(b.name));
     } catch (e) {
       appendConsole('Failed to load item catalog: ' + e.message + '\n');
     }
+  }
+
+  async function loadOnlineActionCatalog() {
+    if (onlineActionCatalog) return;
+    try {
+      onlineActionCatalog = await api('GET', 'online-actions/catalog');
+
+      const moduleSelect = $('#online-skill-module');
+      moduleSelect.innerHTML = '<option value="">— Select a skill or ability —</option>';
+      const byCategory = new Map();
+      (onlineActionCatalog.skillModules || []).forEach(module => {
+        const category = module.category || 'Other';
+        if (!byCategory.has(category)) byCategory.set(category, []);
+        byCategory.get(category).push(module);
+      });
+      [...byCategory.keys()].sort().forEach(category => {
+        const group = document.createElement('optgroup');
+        group.label = category;
+        byCategory.get(category).sort((a, b) => a.name.localeCompare(b.name)).forEach(module => {
+          const option = document.createElement('option');
+          option.value = module.id;
+          option.textContent = `${module.name} (max ${module.maxLevel})`;
+          option.dataset.maxLevel = module.maxLevel;
+          group.appendChild(option);
+        });
+        moduleSelect.appendChild(group);
+      });
+
+      const bulkActionSelect = $('#online-bulk-training-action');
+      bulkActionSelect.innerHTML = '<option value="">— Select a reviewed bulk action —</option>';
+      (onlineActionCatalog.bulkTrainingActions || []).forEach(action => {
+        const option = document.createElement('option');
+        option.value = action.id;
+        option.textContent = action.name;
+        bulkActionSelect.appendChild(option);
+      });
+
+      const augmentBulkButton = $('#btn-online-grant-all-augments');
+      if (augmentBulkButton && Number.isSafeInteger(onlineActionCatalog.confirmedAugmentCount)) {
+        augmentBulkButton.textContent = `Give 1 of Every Confirmed Augment (${onlineActionCatalog.confirmedAugmentCount})`;
+      }
+    } catch (e) {
+      appendConsole('Failed to load online action catalog: ' + e.message + '\n');
+    }
+  }
+
+  function populateOnlineItemCatalog() {
+    const list = $('#online-item-templates');
+    if (!list || !catalogArr.length || list.children.length) return;
+    const fragment = document.createDocumentFragment();
+    catalogArr.forEach(item => {
+      const option = document.createElement('option');
+      option.value = item.tid;
+      option.label = `${item.name} — ${item.category}`;
+      fragment.appendChild(option);
+    });
+    list.appendChild(fragment);
+  }
+
+  function syncOnlineItemQuantityLimit() {
+    const templateId = ($('#online-item-template').value || '').trim();
+    const countInput = $('#online-item-count');
+    const isAugment = itemCatalog?.[templateId]?.category === 'Augments';
+    const genericMaximum = onlineActionCatalog?.limits?.itemCount?.max || 1000;
+    countInput.max = isAugment ? '1' : String(genericMaximum);
+    if (isAugment) countInput.value = '1';
+  }
+
+  function updateOnlineCharacterStatus() {
+    const badge = $('#online-character-status');
+    if (!badge) return;
+    const state = String(charData?.playerState?.onlineStatus || 'Offline');
+    const online = state.toLowerCase() === 'online' && charData?.playerState?.serverId;
+    badge.textContent = online ? 'Online — live actions ready' : `${state} — live actions unavailable`;
+    badge.classList.toggle('online-ready', Boolean(online));
   }
 
   let cosmeticCatalog = null;
@@ -1076,7 +1282,7 @@
       cosmeticArr.sort((a, b) => a.name.localeCompare(b.name));
       const hint = $('#cosmetic-results-hint');
       if (hint && data._meta?.unlockable) {
-        hint.textContent = `Type at least 2 characters to search across ${data._meta.unlockable} unlockable cosmetics (${data._meta.total} total incl. inventory swatch tokens), or pick a category filter.`;
+        hint.textContent = `Type at least 2 characters to search across ${data._meta.unlockable} reviewed persisted cosmetic IDs, or pick a category filter.`;
       }
     } catch (e) {
       appendConsole('Failed to load cosmetic catalog: ' + e.message + '\n');
@@ -1141,12 +1347,18 @@
       const tr = document.createElement('tr');
       const name = catalogName(item.template_id);
       const loc = INVENTORY_LABELS[item.inventory_type] || `Type ${item.inventory_type}`;
+      const grade = item.quality_level == null ? '-' : item.quality_level;
+      const augmentAction = item.augment_eligible
+        ? `<button class="btn-augment-max" data-item-id="${item.id}" ` +
+          `title="Max ${item.augment_roll_count} positive numeric roll(s) and set Grade 5">Max + Grade 5</button>`
+        : '';
       tr.innerHTML = `
         <td class="item-name">${name}</td>
         <td class="item-tid">${item.template_id}</td>
         <td>${item.stack_size}</td>
+        <td>${grade}</td>
         <td>${loc}</td>
-        <td><button class="btn-remove" data-item-id="${item.id}">Remove</button></td>
+        <td><div class="inventory-actions">${augmentAction}<button class="btn-remove" data-item-id="${item.id}">Remove</button></div></td>
       `;
       tbody.appendChild(tr);
     });
@@ -1159,6 +1371,13 @@
     try {
       charData = await api('GET', `characters/${actorId}`);
       $('#char-editor').style.display = '';
+      setCharacterWorkspaceAvailable(true);
+      switchCharacterView('online');
+
+      const selectedCharacter = $('#char-select').selectedOptions[0];
+      $('#character-selection-title').textContent = selectedCharacter?.value
+        ? selectedCharacter.textContent
+        : `Character ${actorId}`;
 
       $$('.char-stat').forEach(el => {
         const field = el.dataset.field;
@@ -1175,6 +1394,7 @@
         }));
 
       renderInventory();
+      updateOnlineCharacterStatus();
     } catch (e) {
       alert('Failed to load character: ' + e.message);
     }
@@ -1184,7 +1404,8 @@
   // Character tab — load list on first open
   let charTabLoaded = false;
   document.querySelector('.tab[data-tab="characters"]').addEventListener('click', async () => {
-    await Promise.all([loadItemCatalog(), loadCosmeticCatalog()]);
+    await Promise.all([loadItemCatalog(), loadCosmeticCatalog(), loadOnlineActionCatalog()]);
+    populateOnlineItemCatalog();
     if (!charTabLoaded) {
       charTabLoaded = true;
       loadCharacterList();
@@ -1244,6 +1465,54 @@
 
   // Remove item
   $('#inv-tbody').addEventListener('click', async (e) => {
+    const augmentBtn = e.target.closest('.btn-augment-max');
+    if (augmentBtn && charData) {
+      if (status && status.battlegroup && status.battlegroup.running) {
+        alert('Stop the battlegroup before changing augment attributes.');
+        return;
+      }
+      const itemId = Number(augmentBtn.dataset.itemId);
+      const item = (charData.items || []).find((candidate) => candidate.id === itemId);
+      if (!item || !item.augment_eligible) {
+        alert('This item is not a supported standalone augment. Refresh the character and try again.');
+        return;
+      }
+      if (!confirm(
+        `Max ${item.augment_roll_count} positive numeric roll(s) on ${catalogName(item.template_id)} and set it to Grade 5?\n\n` +
+        'The character must be logged out. A safety backup will be created first.'
+      )) return;
+
+      augmentBtn.disabled = true;
+      augmentBtn.textContent = 'Working...';
+      showOverlay('Maximizing augment and setting Grade 5...');
+      try {
+        const response = await api(
+          'POST',
+          `characters/${charData.actorId}/inventory/${itemId}/augment/max`,
+          {}
+        );
+        $('#augment-max-result').textContent =
+          `Verified item ${response.itemId}: ${response.numericAttributes} positive numeric roll(s), ` +
+          `${response.changedAttributes} roll value(s) changed, Grade 5` +
+          `${response.gradeChanges ? ' applied' : ' already set'}. Backup: ${response.backup}`;
+        appendConsole(
+          `Augment item ${response.itemId} verified at maximum rolls and Grade 5. ` +
+          `Backup: ${response.backup}.\n`
+        );
+        await loadCharacter(charData.actorId);
+      } catch (error) {
+        $('#augment-max-result').textContent = 'No augment changes were committed: ' + error.message;
+        alert('Augment update failed: ' + error.message);
+      } finally {
+        if (augmentBtn.isConnected) {
+          augmentBtn.disabled = false;
+          augmentBtn.textContent = 'Max + Grade 5';
+        }
+        hideOverlay();
+      }
+      return;
+    }
+
     const btn = e.target.closest('.btn-remove');
     if (!btn || !charData) return;
     if (status && status.battlegroup && status.battlegroup.running) {
@@ -1306,13 +1575,20 @@
         const cat = item.category;
         const maxStack = STACK_LIMITS[cat] || 100;
         const isEq = isEquipmentCategory(cat);
+        const isAugment = cat === 'Augments';
+        const canCreateOffline = isAugment && item.offlineCreatable;
         const tr = document.createElement('tr');
+        if (isAugment) tr.classList.add('offline-augment-row');
         tr.innerHTML = `
-          <td class="item-name">${item.name}<br><span class="item-tid">${item.tid}</span></td>
+          <td class="item-name">${item.name}<br><span class="item-tid">${item.tid}</span>${item.effect ? `<br><span class="item-effect">${item.effect}</span>` : ''}</td>
           <td style="font-size:.72rem;color:var(--text-dim)">${cat}</td>
-          <td><input type="number" value="${isEq ? 1 : 1}" min="1" max="${maxStack}" class="add-qty" data-max="${maxStack}"></td>
-          <td><select class="add-inv">${defaultInvOption}</select></td>
-          <td><button class="btn-add" data-tid="${item.tid}" data-eq="${isEq ? 1 : 0}">Add</button></td>
+          <td>${isAugment ? '<span class="fixed-value">1 fixed</span>' : `<input type="number" value="1" min="1" max="${maxStack}" class="add-qty" data-max="${maxStack}">`}</td>
+          <td>${canCreateOffline ? '<span class="fixed-value">Backpack (automatic)</span>' : isAugment ? '<span class="fixed-value">Native online grant</span>' : `<select class="add-inv">${defaultInvOption}</select>`}</td>
+          <td>${canCreateOffline
+            ? `<button class="btn-create-augment" data-tid="${item.tid}" data-experimental="${item.offlineExperimental ? 1 : 0}">Create Offline</button>`
+            : isAugment
+              ? '<span class="fixed-value">Online only</span>'
+            : `<button class="btn-add" data-tid="${item.tid}" data-eq="${isEq ? 1 : 0}">Add</button>`}</td>
         `;
         tbody.appendChild(tr);
       });
@@ -1330,6 +1606,56 @@
 
   // Add item
   $('#item-results-body').addEventListener('click', async (e) => {
+    const augmentBtn = e.target.closest('.btn-create-augment');
+    if (augmentBtn && charData) {
+      if (status && status.battlegroup && status.battlegroup.running) {
+        alert('Stop the battlegroup before creating an augment offline.');
+        return;
+      }
+      const tid = augmentBtn.dataset.tid;
+      const item = catalogArr.find(candidate => candidate.tid === tid && candidate.category === 'Augments');
+      if (!item) {
+        alert('Select one of the reviewed augments.');
+        return;
+      }
+      const experimentalNotice = augmentBtn.dataset.experimental === '1'
+        ? '\n\nThis template shape was reconstructed from an installed augment and remains experimental. Verify it in-game.'
+        : '';
+      if (!confirm(
+        `Create one ${item.name} in this character's Backpack?\n\n` +
+        'The battlegroup must be fully stopped and the character logged out. A safety backup will be created first. ' +
+        'The native Online Actions grant remains the preferred, game-proven method.' +
+        experimentalNotice
+      )) return;
+
+      augmentBtn.disabled = true;
+      augmentBtn.textContent = 'Creating...';
+      showOverlay('Creating reviewed augment in the Backpack...');
+      try {
+        const response = await api('POST', `characters/${charData.actorId}/inventory/add-augment`, {
+          templateId: tid,
+        });
+        $('#augment-max-result').textContent =
+          `Created ${item.name} as item ${response.itemId} in Backpack position ${response.positionIndex}, ` +
+          `Grade ${response.qualityLevel}. Backup: ${response.backup}. ` +
+          'You can now use Max + Grade 5 while the battlegroup remains stopped and the character stays logged out.';
+        appendConsole(
+          `Verified offline creation of ${item.name} as item ${response.itemId}. Backup: ${response.backup}.\n`
+        );
+        await loadCharacter(charData.actorId);
+        runItemSearch();
+      } catch (error) {
+        alert('Offline augment creation failed: ' + error.message);
+      } finally {
+        if (augmentBtn.isConnected) {
+          augmentBtn.disabled = false;
+          augmentBtn.textContent = 'Create Offline';
+        }
+        hideOverlay();
+      }
+      return;
+    }
+
     const btn = e.target.closest('.btn-add');
     if (!btn || !charData) return;
     if (status && status.battlegroup && status.battlegroup.running) {
@@ -1370,6 +1696,48 @@
     btn.textContent = 'Add';
   });
 
+  // Max all supported standalone augment rolls for the selected offline character and set Grade 5.
+  $('#btn-augment-max-all').addEventListener('click', async () => {
+    if (!charData) { alert('Load a character first.'); return; }
+    if (status && status.battlegroup && status.battlegroup.running) {
+      alert('Stop the battlegroup before changing augment attributes.');
+      return;
+    }
+
+    const confirmed = confirm(
+      'Max every supported standalone augment in this character\'s owned inventories and set each one to Grade 5? ' +
+      'Non-positive sentinel values will be preserved. Already-installed augments are not included.\n\n' +
+      'The character must be logged out. A safety backup will be created before the change.'
+    );
+    if (!confirmed) return;
+
+    const button = $('#btn-augment-max-all');
+    const result = $('#augment-max-result');
+    button.disabled = true;
+    result.textContent = 'Creating a backup and checking augment attributes...';
+    showOverlay('Maximizing supported augments and setting Grade 5...');
+    try {
+      const response = await api('POST', `characters/${charData.actorId}/augments/max-attributes`, {});
+      result.textContent = response.eligibleItems
+        ? `Verified ${response.numericAttributes} positive numeric rolls across ${response.updatedItems} supported standalone augment item(s); ` +
+          `${response.changedAttributes} roll value(s) changed and ${response.gradeChanges} item grade(s) changed to 5. Backup: ${response.backup}`
+        : `No supported standalone augment items were found in this character's owned inventories. Backup: ${response.backup}`;
+      appendConsole(
+        `Augment attributes verified for character ${charData.actorId}: ` +
+        `${response.updatedItems} item(s), ${response.changedAttributes} roll value(s) changed, ` +
+        `${response.gradeChanges} grade(s) changed to 5. ` +
+        `Backup: ${response.backup}.\n`
+      );
+      await loadCharacter(charData.actorId);
+    } catch (e) {
+      result.textContent = 'No augment changes were committed: ' + e.message;
+      alert('Augment update failed: ' + e.message);
+    } finally {
+      button.disabled = false;
+      hideOverlay();
+    }
+  });
+
   // -----------------------------------------------------------------------
   // Cosmetics
   // -----------------------------------------------------------------------
@@ -1392,8 +1760,8 @@
 
     showOverlay('Adding cosmetic...');
     try {
-      await api('POST', `characters/${charData.actorId}/cosmetics/add`, { cosmeticId });
-      appendConsole(`Cosmetic "${cosmeticLabel(cosmeticId)}" added.\n`);
+      const res = await api('POST', `characters/${charData.actorId}/cosmetics/add`, { cosmeticId });
+      appendConsole(`Cosmetic "${cosmeticLabel(cosmeticId)}" added. Backup: ${res.backup}.\n`);
       unlockedCosmetics.add(cosmeticId);
       updateCosmeticCount();
       runCosmeticSearch();
@@ -1416,8 +1784,8 @@
 
     showOverlay('Removing cosmetic...');
     try {
-      await api('POST', `characters/${charData.actorId}/cosmetics/remove`, { cosmeticId });
-      appendConsole(`Cosmetic "${cosmeticLabel(cosmeticId)}" removed.\n`);
+      const res = await api('POST', `characters/${charData.actorId}/cosmetics/remove`, { cosmeticId });
+      appendConsole(`Cosmetic "${cosmeticLabel(cosmeticId)}" removed. Backup: ${res.backup}.\n`);
       unlockedCosmetics.delete(cosmeticId);
       updateCosmeticCount();
       runCosmeticSearch();
@@ -1529,40 +1897,16 @@
     if (status && status.battlegroup && status.battlegroup.running) {
       alert('Stop the battlegroup first.'); return;
     }
-    if (!confirm('Unlock ALL cosmetics and swatches from the catalog on this character?')) return;
+    if (!confirm('Unlock all reviewed persisted cosmetics on this character? Existing entries are preserved and a database backup is created first.')) return;
 
     showOverlay('Unlocking all cosmetics...');
     try {
       const res = await api('POST', `characters/${charData.actorId}/cosmetics/unlock-all`);
-      appendConsole(`Unlocked ${res.total} cosmetics (${res.added} newly added).\n`);
+      appendConsole(`Verified ${res.total} cosmetics. Backup: ${res.backup}.\n`);
       await loadCosmetics();
       runCosmeticSearch();
     } catch (e) {
-      const needsFallback = /404|endpoint not found|manager needs restart/i.test(e.message);
-      if (needsFallback && cosmeticArr.length) {
-        if (!confirm(
-          'Bulk unlock API is unavailable (Server Manager needs a restart).\n\n' +
-          'Use slower one-by-one unlock instead? (~621 requests, may take a few minutes)'
-        )) {
-          hideOverlay();
-          return;
-        }
-        const missing = cosmeticArr.filter(c => !unlockedCosmetics.has(c.id));
-        let added = 0;
-        for (let i = 0; i < missing.length; i++) {
-          overlayText.textContent = `Unlocking ${i + 1} / ${missing.length}...`;
-          try {
-            await api('POST', `characters/${charData.actorId}/cosmetics/add`, { cosmeticId: missing[i].id });
-            unlockedCosmetics.add(missing[i].id);
-            added++;
-          } catch { /* skip failures / duplicates */ }
-        }
-        appendConsole(`Unlocked ${unlockedCosmetics.size} cosmetics (${added} newly added via fallback).\n`);
-        updateCosmeticCount();
-        runCosmeticSearch();
-      } else {
-        alert('Failed: ' + e.message + '\n\nStop and restart the Server Manager (start_as_admin.bat), then try again.');
-      }
+      alert('Failed: ' + e.message + '\n\nStop and restart the Server Manager (start_as_admin.bat), then try again.');
     }
     hideOverlay();
   });
@@ -1570,32 +1914,13 @@
   // -----------------------------------------------------------------------
   // Tech Tree
   // -----------------------------------------------------------------------
-  let techCatalogTotal = null;
-
-  async function loadTechCatalogTotal() {
-    if (techCatalogTotal != null) return techCatalogTotal;
-    try {
-      const res = await fetch('/data/tech-recipe-catalog.json');
-      const data = await res.json();
-      techCatalogTotal = data.total || Object.keys(data.recipes || {}).length;
-    } catch {
-      techCatalogTotal = null;
-    }
-    return techCatalogTotal;
-  }
-
   async function refreshTechCount() {
     if (!charData) return;
     try {
       const d = await api('GET', `characters/${charData.actorId}`);
       const tree = d.properties?.TechKnowledgePlayerComponent?.m_TechKnowledge?.m_TechKnowledgeData || [];
       const purchased = tree.filter(i => i.UnlockedState === 'Purchased').length;
-      const catalogTotal = await loadTechCatalogTotal();
-      if (catalogTotal != null) {
-        $('#tech-count').textContent = `${purchased} purchased / ${tree.length} in save / ${catalogTotal} in game`;
-      } else {
-        $('#tech-count').textContent = `${purchased} / ${tree.length} unlocked`;
-      }
+      $('#tech-count').textContent = `${purchased} purchased / ${tree.length} valid entries`;
     } catch { /* silent */ }
   }
 
@@ -1604,12 +1929,11 @@
     if (status && status.battlegroup && status.battlegroup.running) {
       alert('Stop the battlegroup first.'); return;
     }
-    if (!confirm('Unlock ALL tech tree recipes? This adds every game recipe node to your save.')) return;
+    if (!confirm('Unlock every valid tech entry already created by the game for this character? A database backup will be created first.')) return;
     showOverlay('Unlocking all recipes...');
     try {
       const res = await api('POST', `characters/${charData.actorId}/tech/unlock-all`);
-      appendConsole(`Tech tree: ${res.total} recipes unlocked (+${res.added} added to save, was ${res.previous}).\n`);
-      techCatalogTotal = res.catalogTotal ?? techCatalogTotal;
+      appendConsole(`Tech tree: ${res.total} valid entries unlocked; no guessed nodes injected. Backup: ${res.backup}.\n`);
       await refreshTechCount();
     } catch (e) { alert('Failed: ' + e.message); }
     hideOverlay();
@@ -1684,10 +2008,104 @@
 
     showOverlay(`Setting ${track}...`);
     try {
-      await api('POST', `characters/${charData.actorId}/specializations/track`, {
+      const res = await api('POST', `characters/${charData.actorId}/specializations/track`, {
         trackType: track, xp, level,
       });
-      appendConsole(`${track} set to level ${level}, ${xp} XP.\n`);
+      appendConsole(`${track} set to level ${level}, ${xp} XP. Backup: ${res.backup}.\n`);
+      await loadSpecializations();
+    } catch (e) { alert('Failed: ' + e.message); }
+    hideOverlay();
+  });
+
+  $('#online-skill-module').addEventListener('change', (e) => {
+    const selected = e.target.selectedOptions[0];
+    const maximum = parseInt(selected?.dataset.maxLevel || '1', 10);
+    const level = $('#online-skill-level');
+    level.max = maximum;
+    if (parseInt(level.value, 10) > maximum) level.value = maximum;
+  });
+
+  $('#online-item-template').addEventListener('input', syncOnlineItemQuantityLimit);
+  $('#online-item-template').addEventListener('change', syncOnlineItemQuantityLimit);
+
+  $$('.online-action-btn').forEach(button => button.addEventListener('click', async () => {
+    if (!charData) { alert('Load a character first.'); return; }
+    const action = button.dataset.onlineAction;
+    let body = { action };
+    let confirmation = '';
+
+    if (action === 'award-xp') {
+      body.category = $('#online-xp-category').value;
+      body.amount = Number($('#online-xp-amount').value);
+      confirmation = `Add ${body.amount.toLocaleString()} ${body.category} XP to this online character?`;
+    } else if (action === 'set-skill-points') {
+      body.points = Number($('#online-skill-points').value);
+      confirmation = `Set this character's unspent skill points to ${body.points.toLocaleString()}? This replaces the current unspent amount.`;
+    } else if (action === 'set-skill-module') {
+      body.moduleId = $('#online-skill-module').value;
+      body.level = Number($('#online-skill-level').value);
+      if (!body.moduleId) { alert('Select a skill or ability first.'); return; }
+      const label = $('#online-skill-module').selectedOptions[0]?.textContent || body.moduleId;
+      confirmation = `Set ${label} to level ${body.level}?`;
+    } else if (action === 'give-item') {
+      body.templateId = $('#online-item-template').value.trim();
+      if (!itemCatalog || !Object.prototype.hasOwnProperty.call(itemCatalog, body.templateId)) {
+        alert('Select an exact item from the reviewed catalog.'); return;
+      }
+      syncOnlineItemQuantityLimit();
+      body.count = Number($('#online-item-count').value);
+      body.durability = Number($('#online-item-durability').value);
+      const packageOnly = itemCatalog[body.templateId].packageOnly === true;
+      body.confirmPackageOnly = packageOnly;
+      confirmation = `Give ${body.count.toLocaleString()} × ${catalogName(body.templateId)} to this online character? Items that do not fit may be handled by the game near the player.` +
+        (packageOnly
+          ? '\n\nEXPERIMENTAL PACKAGE-ONLY ID: it exists in the current 1.4 Systems.pak, but has not been observed as a persisted player item. The game may ignore it or create an unfinished item. Continue?'
+          : '');
+    } else if (action === 'grant-all-confirmed-augments') {
+      const augmentCount = onlineActionCatalog?.confirmedAugmentCount || 105;
+      const excludedCount = onlineActionCatalog?.excludedPackageOnlyAugmentCount || 22;
+      confirmation = `Queue exactly one of each of the ${augmentCount} metadata-confirmed augments for this online character? Commands are paced about 300 ms apart and will take roughly ${Math.ceil(augmentCount * 0.3)} seconds.\n\nThe ${excludedCount} package-only experimental candidates are excluded. Make plenty of inventory space; overflow may be placed near the character. Broker acceptance only means queued, not applied.`;
+    } else if (action === 'run-training-batch') {
+      body.bulkActionId = $('#online-bulk-training-action').value;
+      if (!body.bulkActionId) { alert('Select a reviewed bulk action first.'); return; }
+      confirmation = `Run ${$('#online-bulk-training-action').selectedOptions[0].textContent} for this online character? Commands are sent about 300 ms apart and may take several seconds.`;
+    } else if (action === 'grant-solari') {
+      body.amount = Number($('#online-solari-amount').value);
+      confirmation = `Give ${body.amount.toLocaleString()} carried Solari to this online character through the live game channel?`;
+    }
+
+    if (!confirm(confirmation)) return;
+    const result = $('#online-action-result');
+    result.className = 'online-action-result working';
+    result.textContent = 'Sending action...';
+    showOverlay('Sending online action...');
+    button.disabled = true;
+    try {
+      const response = await api('POST', `characters/${charData.actorId}/online-actions`, body);
+      result.className = 'online-action-result success';
+      result.textContent = response.message;
+      appendConsole(response.message + '\n');
+    } catch (e) {
+      result.className = 'online-action-result error';
+      result.textContent = e.message;
+      alert('Online action failed: ' + e.message);
+    } finally {
+      button.disabled = false;
+      hideOverlay();
+    }
+  }));
+
+  $('#btn-spec-max-all').addEventListener('click', async () => {
+    if (!charData) return;
+    if (status && status.battlegroup && status.battlegroup.running) {
+      alert('Stop the battlegroup first.'); return;
+    }
+    if (!confirm('Max all five specialization tracks and unlock every keystone? A database backup will be created first.')) return;
+
+    showOverlay('Maxing all specializations...');
+    try {
+      const res = await api('POST', `characters/${charData.actorId}/specializations/max-all`);
+      appendConsole(`All tracks set to level ${res.level} / ${res.xp} XP and all keystones unlocked. Backup: ${res.backup}.\n`);
       await loadSpecializations();
     } catch (e) { alert('Failed: ' + e.message); }
     hideOverlay();
@@ -1707,8 +2125,8 @@
 
     showOverlay(`Unlocking ${trackName} keystones...`);
     try {
-      await api('POST', `characters/${charData.actorId}/specializations/unlock-keystones`, { trackPrefix: prefix });
-      appendConsole(`All ${trackName} keystones unlocked.\n`);
+      const res = await api('POST', `characters/${charData.actorId}/specializations/unlock-keystones`, { trackPrefix: prefix });
+      appendConsole(`All ${trackName} keystones unlocked. Backup: ${res.backup}.\n`);
     } catch (e) { alert('Failed: ' + e.message); }
     hideOverlay();
   });
@@ -1763,8 +2181,8 @@
 
     showOverlay('Setting currency...');
     try {
-      await api('POST', `characters/${charData.actorId}/economy/currency`, { currencyId: cid, balance });
-      appendConsole(`Currency ${cid} set to ${balance}.\n`);
+      const response = await api('POST', `characters/${charData.actorId}/economy/currency`, { currencyId: cid, balance });
+      appendConsole(`Currency ${response.currencyId} verified at ${response.balance}. Backup: ${response.backup}.\n`);
     } catch (e) { alert('Failed: ' + e.message); }
     hideOverlay();
   });

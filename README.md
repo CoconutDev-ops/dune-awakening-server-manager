@@ -41,7 +41,7 @@ A local web-based UI for managing **Dune: Awakening Self-Hosted Servers**. Repla
 - **Setup Wizard** — Guided 6-step first-time installation (VM import, network, SSH, bootstrap — no bat file needed)
 - **Dashboard** — VM status, memory, uptime, IP, and battlegroup health at a glance
 - **Battlegroup Controls** — Start, stop, restart, and update with one click
-- **Character Editor** — Edit stats (health, tech points, hydration, spice, Eyes of Ibad) and manage inventory with a searchable 1,000-item catalog
+- **Character Editor** — Edit stats (health, tech points, hydration, spice, Eyes of Ibad) and manage inventory with a searchable 1,127-entry catalog; 105 confirmed augment templates and 22 clearly marked current-package-only candidates support native online attempts, while three reviewed database shapes support guarded offline Backpack creation
 - **Game Config** — Edit PvP, sandstorms, sandworm behavior, mining rates, decay, building limits, and more through a visual editor
 - **Monitoring** — Direct links to the File Browser and Director web interfaces
 - **Database** — Take and import backups
@@ -146,7 +146,27 @@ Back up and restore the battlegroup database. Stop the battlegroup first for bes
 
 ### Characters
 
-Edit player stats and inventory directly in the game database. **Stop the battlegroup and have the player logged out before editing.** Includes a searchable catalog of **1,000 items** (wiki scrape + game-file IDs for vehicle modules, patents, and more).
+The character page has two deliberately separate paths. **Online Actions** send typed, allowlisted commands through the running game's native Version 2 notification channel; the selected character must be fully online. Available actions are additive XP, unspent skill points, reviewed individual skill modules, items from the 1,127-entry combined catalog, three reviewed bulk training actions, and a bulk grant of exactly one of each metadata-confirmed augment. The item set includes 105 metadata-confirmed augment base templates plus 22 clearly marked current-package-only candidates. The bulk augment button validates an exact 105-ID confirmed subset server-side and queues one native `AddItemToInventory` command per template; it deliberately excludes all 22 package-only candidates, which remain individual experimental actions requiring their existing warning. Recipe, schematic, asset-only, partial, and typo strings are deliberately excluded. The bulk actions expand server-side into fixed native messages rather than relying on retail-incompatible `CheatScript` commands. Messages are paced about 300 ms apart, and success requires an exact broker count; an ambiguous result is never retried automatically. Broker acceptance means the actions were queued, not that the client has applied them, so verify the result in-game and check nearby ground for inventory overflow.
+
+Online Actions also includes additive **carried Solari**. It queues the fixed `SolarisCoin` template through the same live `AddItemToInventory` command as working item grants; check the character's inventory or nearby ground to confirm delivery. The separate Economy editor changes the saved virtual-wallet balance and remains an offline database operation.
+
+The individual module picker is pinned to 145 observed skill and ability modules, including each module's reviewed maximum level. Its catalog was imported from the persisted-player-derived `admin-skill-modules.json` in `snapetech/DuneAwakeningSelfHost`; the backend enforces the exact ID and per-module maximum rather than accepting typed module names.
+
+The remaining controls are **direct database edits**. Stop the battlegroup and have the player logged out before using those controls. Current game builds can leave a stopped character labelled `LoggingOut` with its previous `server_id`; guarded offline workflows treat that label as stale only when the ID is null or no longer exists in `active_server_ids`. A non-offline label that still matches an active server remains blocked by those guarded workflows.
+
+Edit player stats and inventory directly in the game database. **Stop the battlegroup and have the player logged out before editing.** The combined picker contains **1,127 entries**: 1,000 standard entries, 105 metadata-confirmed augment base templates, and 22 current-package-only experimental candidates. Augments never use the generic raw Add Item route. The dedicated **Create Offline** action remains restricted to the three templates whose standalone database shapes have been reviewed; it targets the selected character's single Backpack, creates one item in the lowest free slot, creates a verified backup, locks and rechecks ownership/capacity, and verifies the exact inserted row before commit.
+
+The Online Actions Give Item picker and offline Add Item search include all 105 confirmed templates and 22 package-only candidates under **Augments**. Native online grant is preferred because the running game creates the item and its correct roll structure. Augment grants are fixed to quantity 1; package-only candidates require an additional warning and may be ignored or unfinished. Only Heavy Caliber Upgrade, House Heavy Caliber Upgrade, and Barrel Extender expose **Create Offline**: Heavy Caliber uses a loose persisted-item seed, while the other two use reviewed installed-item-derived seeds and are marked experimental. After offline creation, keep the battlegroup stopped and the character logged out and use **Max + Grade 5** on the new standalone item.
+
+| Template | Name | Applies to | Reviewed effect ranges |
+|---|---|---|---|
+| `T6_Augment_Damage1` | Heavy Caliber Upgrade | Any ranged weapon | Ranged Damage: G1 +2–8%, G2 +9–15%, G3 +18–26%, G4 +28–44%, G5 +48–70% |
+| `T6_Augment_Damage2` | House Heavy Caliber Upgrade | Any ranged weapon | Ranged Damage: G1 +8–10%, G2 +9–15%, G3 +18–26%, G4 +28–44%, G5 +48–70% theoretical; local metadata marks it non-gradeable, so forced G5 still needs in-game verification |
+| `T6_Augment_Range1` | Barrel Extender | Any ranged weapon | Effective Range and Maximum Range: G1 +2–5%, G2 +6–10%, G3 +11–15%, G4 +17–20%, G5 +22–25% |
+
+Eligible standalone augment rows show their current grade and a **Max + Grade 5** action. It safely raises every positive numeric roll to the confirmed maximum `1.003398`, preserves non-positive sentinels and non-numeric entries, and sets `quality_level` to 5. **Max All Supported Augments + Grade 5** applies the same operation only to supported standalone augments in the selected character's owned inventories; it never uses a world-wide or hard-coded inventory scope. The manager validates the selected item before backup, creates a verified database backup, confirms the battlegroup is fully stopped and the character has no active game-server session on both sides of that backup, then locks and verifies the targeted rows inside one transaction.
+
+Augments already installed into a weapon or other equipment are represented under `FAugmentedItemStats`, not the standalone `FAugmentItemStats.StatRolls` array handled here. They are intentionally left unchanged until a separate slot-aware editor is implemented.
 
 ![Character Editor](docs/screenshots/character-editor.png)
 
@@ -159,14 +179,16 @@ Search for any item by display name **or template ID** (e.g. `TreadwheelChassis_
 
 | Section | What you can edit |
 |---------|------------------|
+| **Online Actions** | Live XP, skill points, reviewed skill modules, fixed reviewed bulk training actions, catalogued items, one of every confirmed augment, and carried Solari through the game-native item channel |
 | **Stats** | Max Health, Tech Knowledge Points, Hydration, Heat Exhaustion, Spice, Addiction Level, Tolerance, Eyes of Ibad |
-| **Inventory** | View all items, remove items, add items by name or template ID from a 1,000-item catalog with category filter |
+| **Inventory** | View all items and grades, max an eligible standalone augment plus set Grade 5, remove items, search 105 confirmed augments plus 22 package-only candidates, or create one of the three reviewed database shapes through the guarded offline Backpack workflow; native Online Actions grant remains preferred |
+| **Augment Attributes** | Backup-first maximum positive rolls plus Grade 5 for supported standalone augment items in the selected character's owned inventories; installed augments are intentionally excluded |
 | **Stack limits** | Equipment (weapons/armor/tools) enforced at 1, resources at 100, consumables at 20 — warns before exceeding |
-| **Tech Tree** | Unlock or lock all fabrication recipes and blueprints — **Unlock All** merges all **356** game tech nodes into your save (not just ones already discovered) |
-| **Specializations** | Set level and XP for Combat, Crafting, Exploration, Gathering, Sabotage — unlock all 205 keystones (perks) per tree |
+| **Tech Tree** | Safely unlock the game-created fabrication and blueprint entries already present in the character save; guessed pak-only nodes are never injected |
+| **Specializations** | Set level and XP for Combat, Crafting, Exploration, Gathering, Sabotage, or max all tracks to level 100 / 44,182 XP and unlock all 205 keystones using the player-controller record |
 | **Economy** | Set Solari and House Scrip balances |
 | **Faction Reputation** | Set reputation with Atreides, Harkonnen, and Smuggler factions |
-| **Cosmetics & Skins** | Searchable catalog of **621** cosmetics (dye packs, MTX skins, armor/weapon/vehicle swatches) — click Add/Remove per row, or **Unlock All Cosmetics & Swatches** in one shot |
+| **Cosmetics & Skins** | Searchable reviewed catalog of **391** customization IDs observed in persisted player data — exact Add/Remove or backup-first bulk unlock; inventory swatch tokens are excluded |
 
 Tech tree, specializations, economy, and faction reputation:
 
@@ -228,9 +250,10 @@ The app is a lightweight Node.js server that:
 2. Uses **SSH** to communicate with the VM for battlegroup commands (same key and mechanism as the official scripts)
 3. Reads and writes **INI config files** on the VM for game settings
 4. Queries the **PostgreSQL** database via `kubectl exec` for character editing
-5. Serves a static web UI that talks to the REST API and receives real-time output over WebSocket
+5. Publishes allowlisted live player actions through the running `mq-game` RabbitMQ pod
+6. Serves a static web UI that talks to the REST API and receives real-time output over WebSocket
 
-No data leaves your machine. Everything runs locally on `localhost:3000`.
+No data leaves your machine. The manager listens only on `127.0.0.1:3000` and rejects non-local HTTP and WebSocket hosts.
 
 ## Project Structure
 
@@ -244,8 +267,9 @@ No data leaves your machine. Everything runs locally on `localhost:3000`.
 │   ├── css/style.css      # Dune-themed dark UI
 │   ├── js/app.js          # Frontend logic (tabs, wizard, config editor, character editor, API calls)
 │   └── data/
-│       ├── item-catalog.json      # 1,000 items (wiki + CUE4Parse game-file IDs)
-│       ├── cosmetic-catalog.json  # 621 cosmetics/skins/swatches (from Systems.pak)
+│       ├── item-catalog.json      # 1,003 base entries (including 3 database-observed augments)
+│       ├── augment-catalog.json   # 105 metadata-confirmed + 22 package-only augment candidates
+│       ├── cosmetic-catalog.json  # 391 reviewed persisted cosmetic IDs
 │       └── stat-reference.json    # Character stat keys and inventory type mapping
 ├── scripts/
 │   └── build-cosmetic-catalog.py  # Regenerate cosmetic-catalog.json from game paks
@@ -264,6 +288,7 @@ No data leaves your machine. Everything runs locally on `localhost:3000`.
 | SSH key path | `%LOCALAPPDATA%\DuneAwakeningServer\sshKey` | `getKeyPath()` in `lib/ssh.js` |
 | VM name | `dune-awakening` | `VM_NAME` in `server.js` |
 | Web UI port | `3000` | `PORT` in `server.js` or `PORT` env variable |
+| Server-command token | Official self-host default | Optional `DUNE_SERVER_COMMANDS_AUTH_TOKEN` environment override; never returned by the API |
 
 ## Troubleshooting
 

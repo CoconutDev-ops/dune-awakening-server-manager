@@ -8,18 +8,37 @@ const ssh = require('./lib/ssh');
 const vmCtl = require('./lib/vm');
 const dunePaths = require('./lib/paths');
 
+const PORT = process.env.PORT || 3000;
+const HOST = '127.0.0.1';
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
-
-const PORT = process.env.PORT || 3000;
+const wss = new WebSocketServer({
+  server,
+  verifyClient(info, done) {
+    const requestHost = String(info.req.headers.host || '').toLowerCase();
+    const origin = String(info.origin || '').toLowerCase();
+    const localHost = /^(?:localhost|127\.0\.0\.1)(?::\d+)?$/.test(requestHost);
+    const localOrigin = /^http:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/.test(origin);
+    done(localHost && localOrigin, localHost && localOrigin ? 101 : 403, 'Local access only');
+  },
+});
 const VM_NAME = vmCtl.VM_NAME;
+const VM_IP_OVERRIDE = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(process.env.DUNE_VM_IP || '')
+  ? process.env.DUNE_VM_IP
+  : null;
 
 const DEFAULT_SERVER_PATH = path.join(
   'C:', 'Program Files (x86)', 'Steam', 'steamapps', 'common',
   'Dune Awakening Self-Hosted Server'
 );
 
+app.use((req, res, next) => {
+  const requestHost = String(req.headers.host || '').toLowerCase();
+  if (!/^(?:localhost|127\.0\.0\.1)(?::\d+)?$/.test(requestHost)) {
+    return res.status(403).json({ error: 'The Server Manager is available only on this PC.' });
+  }
+  next();
+});
 app.use(express.json());
 
 // ---------------------------------------------------------------------------
@@ -72,6 +91,7 @@ async function getVmStatus() {
 }
 
 async function getVmIp() {
+  if (VM_IP_OVERRIDE) return VM_IP_OVERRIDE;
   const st = cachedVmStatus || (await getVmStatus());
   return st && st.ip ? st.ip : null;
 }
@@ -87,6 +107,56 @@ const PORT_FORWARD_INFO = {
   gameUdpStart: 7777,
   gameUdpEnd: 7810,
 };
+
+// Canonical token used by the self-hosted game's built-in Version 2
+// notification consumer. An explicit override keeps this compatible with
+// servers that intentionally changed the token at game-map startup.
+const SERVER_COMMAND_AUTH_TOKEN =
+  process.env.DUNE_SERVER_COMMANDS_AUTH_TOKEN || 'Nu6VmPWUMvdPMeB7qErr';
+
+const REVIEWED_BULK_TRAINING_ACTIONS = Object.freeze([
+  { id: 'award-all-xp', name: 'Add 10,000 XP to all three categories' },
+  { id: 'unlock-all-trainer-skills', name: 'Unlock all reviewed trainer skills and capstones' },
+  { id: 'unlock-all-abilities', name: 'Unlock all reviewed active abilities' },
+]);
+const BULK_TRAINING_MESSAGE_DELAY_MS = 300;
+const EXCLUDED_BULK_ABILITY_MODULES = new Set(['Skills.Ability.VoiceStop']);
+const REVIEWED_BULK_MODULE_COUNTS = Object.freeze({
+  trainerSkills: 30,
+  abilities: 33,
+});
+const REVIEWED_BULK_AUGMENT_COUNT = 105;
+const REVIEWED_PACKAGE_ONLY_AUGMENT_COUNT = 22;
+
+const ONLINE_ACTION_LIMITS = Object.freeze({
+  xp: { min: 1, max: 10000000 },
+  skillPoints: { min: 0, max: 100000 },
+  itemCount: { min: 1, max: 1000 },
+  itemDurability: { min: 0.01, max: 1 },
+  solari: { min: 1, max: 1000000000 },
+});
+const MAX_CURRENCY_BALANCE = 1000000000;
+
+// These are the only standalone augment templates and seed shapes reviewed
+// against this server's persisted data. Offline creation is deliberately kept
+// separate from the generic raw-item insert path.
+const REVIEWED_OFFLINE_AUGMENTS = Object.freeze({
+  T6_Augment_Damage1: Object.freeze({
+    name: 'Heavy Caliber Upgrade',
+    seed: '0.004815',
+    installedDerived: false,
+  }),
+  T6_Augment_Damage2: Object.freeze({
+    name: 'House Heavy Caliber Upgrade',
+    seed: '1.0',
+    installedDerived: true,
+  }),
+  T6_Augment_Range1: Object.freeze({
+    name: 'Barrel Extender',
+    seed: '0.333894',
+    installedDerived: true,
+  }),
+});
 
 async function readSettingsConfIp(vmIp) {
   return (await ssh.run(vmIp,
@@ -1150,6 +1220,10 @@ app.post('/api/config', async (req, res) => {
 
 let dbPodCache = null;
 let dbPodCacheTime = 0;
+let mqPodCache = null;
+let mqPodCacheTime = 0;
+let onlineActionCatalogCache = null;
+const onlineActionLocks = new Set();
 
 async function getDbPod(vmIp) {
   if (dbPodCache && Date.now() - dbPodCacheTime < 120000) return dbPodCache;
@@ -1168,7 +1242,7 @@ async function getDbPod(vmIp) {
 async function runPsql(vmIp, sql, opts = {}) {
   const { ns, name } = await getDbPod(vmIp);
   const remoteCmd =
-    `sudo kubectl exec -i -n ${ns} ${name} -- psql -U dune -d dune -p 15432 -t -A 2>&1`;
+    `sudo kubectl exec -i -n ${ns} ${name} -- psql -U dune -d dune -p 15432 -v ON_ERROR_STOP=1 -t -A`;
   // Pipe SQL via SSH stdin — embedding large queries in the command line hits
   // Windows ENAMETOOLONG (e.g. unlock-all cosmetics with 600+ IDs).
   return ssh.run(vmIp, remoteCmd, null, {
@@ -1176,6 +1250,649 @@ async function runPsql(vmIp, sql, opts = {}) {
     stdin: sql,
   });
 }
+
+async function getMqPod(vmIp) {
+  if (mqPodCache && Date.now() - mqPodCacheTime < 30000) return mqPodCache;
+  const raw = await ssh.run(vmIp,
+    "sudo kubectl get pods --all-namespaces -l role=igw-message-queue,messagequeue=game -o json",
+    null, { timeout: 15000 }
+  );
+  let podList;
+  try {
+    podList = JSON.parse(raw);
+  } catch {
+    throw new Error('Game message broker discovery returned invalid Kubernetes data.');
+  }
+  const readyPods = (podList.items || []).filter((pod) =>
+    pod?.status?.phase === 'Running' &&
+    !pod?.metadata?.deletionTimestamp &&
+    (pod?.status?.conditions || []).some((condition) => condition.type === 'Ready' && condition.status === 'True')
+  );
+  if (readyPods.length !== 1) {
+    throw new Error(`Expected exactly one ready game message broker, found ${readyPods.length}.`);
+  }
+  const ns = String(readyPods[0].metadata?.namespace || '');
+  const name = String(readyPods[0].metadata?.name || '');
+  if (!/^[a-z0-9.-]+$/.test(ns) || !/^[a-z0-9.-]+$/.test(name)) {
+    throw new Error('Game message broker discovery returned an invalid pod identity.');
+  }
+  mqPodCache = { ns, name };
+  mqPodCacheTime = Date.now();
+  return mqPodCache;
+}
+
+function readOnlineActionCatalog() {
+  if (onlineActionCatalogCache) return onlineActionCatalogCache;
+  const skillPath = path.join(__dirname, 'public', 'data', 'skill-module-catalog.json');
+  const itemPath = path.join(__dirname, 'public', 'data', 'item-catalog.json');
+  const augmentPath = path.join(__dirname, 'public', 'data', 'augment-catalog.json');
+  const skillModules = JSON.parse(fs.readFileSync(skillPath, 'utf8'));
+  const itemData = JSON.parse(fs.readFileSync(itemPath, 'utf8'));
+  const augmentData = JSON.parse(fs.readFileSync(augmentPath, 'utf8'));
+  if (
+    !Array.isArray(skillModules) ||
+    !itemData || typeof itemData.items !== 'object' ||
+    !augmentData || typeof augmentData.items !== 'object'
+  ) {
+    throw new Error('Online action catalogs are invalid.');
+  }
+  onlineActionCatalogCache = {
+    skillModules,
+    itemTemplates: { ...itemData.items, ...augmentData.items },
+    augmentTemplates: augmentData.items,
+  };
+  return onlineActionCatalogCache;
+}
+
+function boundedInteger(value, label, minimum, maximum) {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${label} must be a whole number.`);
+  if (parsed < minimum || parsed > maximum) {
+    throw new Error(`${label} must be between ${minimum.toLocaleString()} and ${maximum.toLocaleString()}.`);
+  }
+  return parsed;
+}
+
+function boundedNumber(value, label, minimum, maximum) {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(`${label} must be between ${minimum} and ${maximum}.`);
+  }
+  return parsed;
+}
+
+async function getCharacterCommandTarget(vmIp, pawnId) {
+  const raw = await runPsql(vmIp,
+    `SELECT json_build_object(` +
+    `'pawnId', act.id, ` +
+     `'controllerId', ps.player_controller_id, ` +
+     `'onlineStatus', ps.online_status::text, ` +
+     `'serverId', ps.server_id, ` +
+     `'farmReady', COALESCE(fs.ready, false), ` +
+     `'farmAlive', COALESCE(fs.alive, false), ` +
+     `'activeServer', (asi.server_id IS NOT NULL), ` +
+     `'flsId', account.\"user\"` +
+     `)::text FROM actors act ` +
+     `JOIN accounts account ON account.id = act.owner_account_id ` +
+     `LEFT JOIN player_state ps ON ps.player_pawn_id = act.id ` +
+     `LEFT JOIN farm_state fs ON fs.server_id = ps.server_id ` +
+     `LEFT JOIN active_server_ids asi ON asi.server_id = ps.server_id ` +
+    `WHERE act.id = ${pawnId} LIMIT 1`
+  );
+  const line = raw.trim().split(/\r?\n/).find((value) => value.trim().startsWith('{'));
+  if (!line) throw new Error(`Character pawn ${pawnId} was not found.`);
+  const target = JSON.parse(line);
+  const controllerId = Number.parseInt(target.controllerId, 10);
+  if (!Number.isSafeInteger(controllerId) || controllerId <= 0) {
+    throw new Error(`Character pawn ${pawnId} has no valid player controller.`);
+  }
+  target.controllerId = controllerId;
+  return target;
+}
+
+async function requireOnlineCommandTarget(vmIp, pawnId) {
+  const target = await getCharacterCommandTarget(vmIp, pawnId);
+  // farm_state.ready is advisory on current builds and can remain false after
+  // the map is accepting players. Online + alive + active is the reliable gate.
+  if (String(target.onlineStatus).toLowerCase() !== 'online' || !target.serverId ||
+      target.farmAlive !== true || target.activeServer !== true) {
+    const err = new Error('This live action requires the selected character to be fully online in the game.');
+    err.statusCode = 409;
+    throw err;
+  }
+  const flsId = String(target.flsId || '').trim();
+  if (!flsId || flsId.length > 256 || /[\x00-\x1f\x7f]/.test(flsId)) {
+    throw new Error('The selected character has no valid Funcom player identity.');
+  }
+  target.flsId = flsId;
+  return target;
+}
+
+async function publishServerCommand(vmIp, inner) {
+  const pod = await getMqPod(vmIp);
+  const outer = {
+    Version: 2,
+    AuthToken: SERVER_COMMAND_AUTH_TOKEN,
+    MessageContent: JSON.stringify(inner),
+  };
+  const outerB64 = Buffer.from(JSON.stringify(outer)).toString('base64');
+  const label = String(inner.ServerCommand || 'online-action').toLowerCase().replace(/[^a-z0-9-]+/g, '-').slice(0, 40);
+  const erl = [
+    `Outer = base64:decode(<<\"${outerB64}\">>),`,
+    'XName = rabbit_misc:r(<<\"/\">>, exchange, <<\"heartbeats\">>),',
+    'X = rabbit_exchange:lookup_or_die(XName),',
+    `MsgId = list_to_binary(\"manager-${label}-\" ++ integer_to_list(erlang:system_time(millisecond))),`,
+    'P = {list_to_atom(\"P_basic\"), <<\"Content\">>, undefined, [], undefined, undefined, undefined, undefined, undefined, MsgId, undefined, undefined, <<\"fls\">>, <<\"fls_backend\">>, undefined},',
+    'Content = rabbit_basic:build_content(P, Outer),',
+    '{ok, Msg} = rabbit_basic:message(XName, <<\"notifications\">>, Content),',
+    'Result = rabbit_queue_type:publish_at_most_once(X, Msg),',
+    'io:format(\"publish=~p~n\", [Result]),',
+    'Result.',
+  ].join(' ');
+  const erlB64 = Buffer.from(erl).toString('base64');
+  const runner = 'set -eu; export PATH=/opt/rabbitmq/sbin:/opt/erlang/lib/erlang/bin:/bin:/usr/bin:/usr/local/bin:$PATH; expr=$(cat); /opt/rabbitmq/sbin/rabbitmqctl eval "$expr"';
+  const runnerB64 = Buffer.from(runner).toString('base64');
+  const command =
+    `echo ${erlB64} | base64 -d | sudo kubectl exec -i -n ${pod.ns} ${pod.name} -- ` +
+    `sh -lc \"$(echo ${runnerB64} | base64 -d)\" 2>&1`;
+  const output = await ssh.run(vmIp, command, null, { timeout: 30000 });
+  const publishLine = String(output || '').split(/\r?\n/).map((line) => line.trim())
+    .find((line) => line.startsWith('publish='));
+  if (!/^publish=(?:ok|\{ok,enqueued\})\.?$/.test(publishLine || '')) {
+    throw new Error('The game message broker did not accept the live action.');
+  }
+  return { queued: true, command: inner.ServerCommand };
+}
+
+function reviewedBulkModuleIds(catalog, prefix, expectedCount, excludedIds = new Set()) {
+  const ids = catalog.skillModules
+    .filter((module) => module && module.category !== 'Hidden' &&
+      typeof module.id === 'string' && module.id.startsWith(prefix) &&
+      !excludedIds.has(module.id))
+    .map((module) => module.id);
+  const uniqueCount = new Set(ids).size;
+  if (ids.length !== expectedCount || uniqueCount !== expectedCount) {
+    throw new Error(
+      `The reviewed ${prefix} catalog subset is invalid: expected exactly ${expectedCount} unique modules, found ${ids.length} entries and ${uniqueCount} unique IDs.`
+    );
+  }
+  return ids;
+}
+
+function reviewedBulkAugmentIds(catalog) {
+  const entries = Object.entries(catalog.augmentTemplates || {});
+  const expectedTotal = REVIEWED_BULK_AUGMENT_COUNT + REVIEWED_PACKAGE_ONLY_AUGMENT_COUNT;
+  if (entries.length !== expectedTotal || entries.some(([templateId, item]) =>
+    !templateId.startsWith('T6_Augment_') || !item || item.category !== 'Augments')) {
+    throw new Error(`The reviewed augment catalog is invalid: expected exactly ${expectedTotal} T6 augment templates.`);
+  }
+  const ids = entries
+    .filter(([, item]) => item.packageOnly !== true)
+    .map(([templateId]) => templateId);
+  const packageOnlyIds = entries
+    .filter(([, item]) => item.packageOnly === true)
+    .map(([templateId]) => templateId);
+  const uniqueCount = new Set(ids).size;
+  const packageOnlyUniqueCount = new Set(packageOnlyIds).size;
+  if (ids.length !== REVIEWED_BULK_AUGMENT_COUNT || uniqueCount !== REVIEWED_BULK_AUGMENT_COUNT ||
+      packageOnlyIds.length !== REVIEWED_PACKAGE_ONLY_AUGMENT_COUNT ||
+      packageOnlyUniqueCount !== REVIEWED_PACKAGE_ONLY_AUGMENT_COUNT) {
+    throw new Error(
+      `The reviewed augment catalog subset is invalid: expected exactly ${REVIEWED_BULK_AUGMENT_COUNT} unique confirmed templates and ${REVIEWED_PACKAGE_ONLY_AUGMENT_COUNT} unique package-only templates.`
+    );
+  }
+  return ids;
+}
+
+function buildReviewedBulkAugmentGrant(playerId, catalog) {
+  const templateIds = reviewedBulkAugmentIds(catalog);
+  const commands = templateIds.map((templateId) => ({
+    ServerCommand: 'AddItemToInventory',
+    PlayerId: playerId,
+    ItemName: templateId,
+    Quantity: 1,
+    Durability: 1,
+  }));
+  return { commands, templateIds };
+}
+
+function buildReviewedBulkTrainingAction(actionId, playerId, catalog) {
+  switch (actionId) {
+    case 'award-all-xp': {
+      const commands = ['Combat', 'Exploration', 'Science'].map((category) => ({
+        ServerCommand: 'AwardXP',
+        PlayerId: playerId,
+        Category: category,
+        Experience: 10000,
+      }));
+      return { commands, description: 'Add 10,000 XP to all three categories' };
+    }
+    case 'unlock-all-trainer-skills': {
+      const commands = reviewedBulkModuleIds(
+        catalog,
+        'Skills.Key.',
+        REVIEWED_BULK_MODULE_COUNTS.trainerSkills
+      ).map((moduleId) => ({
+        ServerCommand: 'SkillsSetModuleLevel',
+        PlayerId: playerId,
+        Module: moduleId,
+        Level: 1,
+      }));
+      return { commands, description: 'Unlock all reviewed trainer skills and capstones' };
+    }
+    case 'unlock-all-abilities': {
+      const commands = reviewedBulkModuleIds(
+        catalog,
+        'Skills.Ability.',
+        REVIEWED_BULK_MODULE_COUNTS.abilities,
+        EXCLUDED_BULK_ABILITY_MODULES
+      ).map((moduleId) => ({
+        ServerCommand: 'SkillsSetModuleLevel',
+        PlayerId: playerId,
+        Module: moduleId,
+        Level: 1,
+      }));
+      return { commands, description: 'Unlock all reviewed active abilities' };
+    }
+    default:
+      throw new Error('Select one of the reviewed bulk training actions.');
+  }
+}
+
+async function publishServerCommandBatch(vmIp, commands) {
+  if (!Array.isArray(commands) || commands.length === 0) {
+    throw new Error('The reviewed bulk action did not produce any commands.');
+  }
+
+  const pod = await getMqPod(vmIp);
+  const encodedMessages = commands.map((inner) => {
+    const outer = {
+      Version: 2,
+      AuthToken: SERVER_COMMAND_AUTH_TOKEN,
+      MessageContent: JSON.stringify(inner),
+    };
+    return Buffer.from(JSON.stringify(outer)).toString('base64');
+  });
+  const payloadList = `[${encodedMessages.map((value) => `<<"${value}">>`).join(',')}]`;
+  const erl = [
+    `Payloads = ${payloadList},`,
+    'XName = rabbit_misc:r(<<"/">>, exchange, <<"heartbeats">>),',
+    'X = rabbit_exchange:lookup_or_die(XName),',
+    'Publish = fun Loop([], Count) -> Count;',
+    'Loop([OuterB64 | Rest], Count) ->',
+    'Outer = base64:decode(OuterB64),',
+    'MsgId = list_to_binary("manager-bulk-" ++ integer_to_list(erlang:system_time(microsecond)) ++ "-" ++ integer_to_list(erlang:unique_integer([monotonic, positive]))),',
+    'P = {list_to_atom("P_basic"), <<"Content">>, undefined, [], undefined, undefined, undefined, undefined, undefined, MsgId, undefined, undefined, <<"fls">>, <<"fls_backend">>, undefined},',
+    'Content = rabbit_basic:build_content(P, Outer),',
+    '{ok, Msg} = rabbit_basic:message(XName, <<"notifications">>, Content),',
+    'Result = rabbit_queue_type:publish_at_most_once(X, Msg),',
+    'NextCount = case Result of ok -> Count + 1; {ok, enqueued} -> Count + 1; Other -> erlang:error({publish_rejected, Other}) end,',
+    `case Rest of [] -> ok; _ -> timer:sleep(${BULK_TRAINING_MESSAGE_DELAY_MS}) end,`,
+    'Loop(Rest, NextCount)',
+    'end,',
+    'Accepted = Publish(Payloads, 0),',
+    `Expected = ${commands.length},`,
+    'true = (Accepted =:= Expected),',
+    'io:format("bulk_publish_ok=~B~n", [Accepted]),',
+    '{ok, Accepted}.',
+  ].join(' ');
+  const runner = 'set -eu; export PATH=/opt/rabbitmq/sbin:/opt/erlang/lib/erlang/bin:/bin:/usr/bin:/usr/local/bin:$PATH; expr=$(cat); /opt/rabbitmq/sbin/rabbitmqctl eval "$expr"';
+  const runnerB64 = Buffer.from(runner).toString('base64');
+  const command =
+    `sudo kubectl exec -i -n ${pod.ns} ${pod.name} -- ` +
+    `sh -lc "$(echo ${runnerB64} | base64 -d)" 2>&1`;
+
+  let output;
+  try {
+    output = await ssh.run(vmIp, command, null, { stdin: erl, timeout: 60000 });
+  } catch (error) {
+    const ambiguous = new Error(
+      'The bulk action did not return a complete broker receipt. Some commands may have been queued; no automatic retry was attempted.'
+    );
+    ambiguous.cause = error;
+    throw ambiguous;
+  }
+
+  const markers = String(output || '').split(/\r?\n/).map((line) => line.trim())
+    .filter((line) => /^bulk_publish_ok=\d+$/.test(line));
+  const accepted = markers.length === 1 ? Number(markers[0].split('=')[1]) : NaN;
+  if (accepted !== commands.length) {
+    throw new Error(
+      'The bulk action did not return an exact broker receipt. Some commands may have been queued; no automatic retry was attempted.'
+    );
+  }
+  return { queuedCount: accepted, commandCount: commands.length };
+}
+
+function parsePawnId(value) {
+  if (typeof value === 'string' && !/^[1-9]\d*$/.test(value)) return null;
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+function offlinePresencePredicateSql(playerAlias) {
+  return `(` +
+    `lower(${playerAlias}.online_status::text) = 'offline' OR ` +
+    `${playerAlias}.server_id IS NULL OR ` +
+    `NOT EXISTS (SELECT 1 FROM active_server_ids asi ` +
+    `WHERE asi.server_id = ${playerAlias}.server_id)` +
+    `)`;
+}
+
+async function requireStoppedOfflineCharacter(vmIp, pawnId) {
+  const status = await ssh.run(
+    vmIp,
+    '/home/dune/.dune/bin/battlegroup status',
+    null,
+    { timeout: 15000 }
+  );
+  const sections = status.split(/Game Servers/i);
+  const battlegroupSuspended =
+    /^\s*of\s+\d+\s+Ready\s+0\/0\s+Suspended\s*$/mi.test(sections[0] || '');
+  const gameServerLines = (sections[1] || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const separatorIndex = gameServerLines.findIndex((line) => /^-+(?:\s+-+)+$/.test(line));
+  const gameServerRows = separatorIndex >= 0
+    ? gameServerLines.slice(separatorIndex + 1).filter((line) => !/No resources found/i.test(line))
+    : [];
+  const gameServersEmpty = separatorIndex >= 0 && gameServerRows.length === 0;
+  if (sections.length < 2 || !battlegroupSuspended || !gameServersEmpty) {
+    throw new Error('Battlegroup is not confirmed fully stopped; character changes were refused.');
+  }
+
+  const raw = await runPsql(vmIp,
+    `SELECT COALESCE(json_agg(json_build_object(` +
+    `'pawnId', ps.player_pawn_id, ` +
+    `'controllerId', ps.player_controller_id, ` +
+    `'onlineStatus', ps.online_status::text, ` +
+    `'serverId', ps.server_id, ` +
+    `'activeServer', EXISTS (SELECT 1 FROM active_server_ids asi ` +
+    `WHERE asi.server_id = ps.server_id), ` +
+    `'effectivelyOffline', ${offlinePresencePredicateSql('ps')}` +
+    `)), '[]'::json)::text FROM player_state ps WHERE ps.player_pawn_id = ${pawnId}`
+  );
+  const line = raw.trim().split(/\r?\n/).find((value) => value.trim().startsWith('['));
+  const players = line ? JSON.parse(line) : [];
+  if (!Array.isArray(players) || players.length === 0) {
+    throw new Error(`Character pawn ${pawnId} was not found.`);
+  }
+  if (players.length !== 1) {
+    throw new Error(`Character pawn ${pawnId} has ambiguous player-state rows; character changes were refused.`);
+  }
+  const player = players[0];
+  if (player.effectivelyOffline !== true) {
+    const rawStatus = String(player.onlineStatus || 'Unknown');
+    throw new Error(
+      `The character must be fully logged out because it still has an active game-server session ` +
+      `(database status: ${rawStatus}).`
+    );
+  }
+  const controllerId = Number.parseInt(player.controllerId, 10);
+  if (!Number.isSafeInteger(controllerId) || controllerId <= 0) {
+    throw new Error(`Character pawn ${pawnId} has no valid player controller.`);
+  }
+  player.controllerId = controllerId;
+  return player;
+}
+
+function offlineCharacterGuardSql(pawnId) {
+  return `DO $character_guard$ ` +
+    `DECLARE selected_player record; ` +
+    `BEGIN ` +
+    `BEGIN ` +
+    `SELECT ps.* INTO STRICT selected_player FROM player_state ps ` +
+    `WHERE ps.player_pawn_id = ${pawnId} FOR UPDATE; ` +
+    `EXCEPTION ` +
+    `WHEN no_data_found THEN RAISE EXCEPTION 'Character pawn ${pawnId} was not found'; ` +
+    `WHEN too_many_rows THEN RAISE EXCEPTION ` +
+    `'Character pawn ${pawnId} has ambiguous player-state rows; character changes were refused'; ` +
+    `END; ` +
+    `IF ${offlinePresencePredicateSql('selected_player')} IS DISTINCT FROM TRUE THEN ` +
+    `RAISE EXCEPTION ` +
+    `'Character pawn ${pawnId} must be fully logged out because it still has an active game-server session (database status: %)', ` +
+    `selected_player.online_status::text; ` +
+    `END IF; ` +
+    `END $character_guard$; `;
+}
+
+async function backupBeforeCharacterMutation(vmIp) {
+  log('Creating safety backup before character change...\n');
+  const output = await ssh.run(
+    vmIp,
+    '/home/dune/.dune/bin/battlegroup backup',
+    log,
+    { timeout: 600000 }
+  );
+  const match = output.match(/Backup file[^:]*:\s*(\S+)/i);
+  if (!match) throw new Error('Database backup did not return a verified backup path; character change refused.');
+  log('Safety backup complete.\n');
+  return match[1];
+}
+
+async function requireOwnedEligibleAugmentItem(vmIp, pawnId, itemId) {
+  const raw = await runPsql(vmIp,
+    `SELECT json_build_object(` +
+    `'ownerId', inv.actor_id, 'templateId', i.template_id, ` +
+    `'eligible', (COALESCE(i.template_id ILIKE '%Augment%', false) AND CASE ` +
+    `WHEN jsonb_typeof(i.stats #> '{FAugmentItemStats,1,StatRolls}') = 'array' ` +
+    `THEN jsonb_array_length(i.stats #> '{FAugmentItemStats,1,StatRolls}') > 0 ` +
+    `ELSE false END)` +
+    `)::text FROM items i JOIN inventories inv ON inv.id = i.inventory_id ` +
+    `WHERE i.id = ${itemId}`
+  );
+  const line = raw.trim().split(/\r?\n/).find((value) => value.trim().startsWith('{'));
+  if (!line) throw new Error(`Item ${itemId} was not found.`);
+  const item = JSON.parse(line);
+  if (Number(item.ownerId) !== pawnId) {
+    throw new Error(`Item ${itemId} is not owned by character ${pawnId}.`);
+  }
+  if (!item.eligible) {
+    throw new Error(`Item ${itemId} is not a supported standalone augment with a nonempty roll array.`);
+  }
+  return item;
+}
+
+async function requireCharacterBackpackCapacity(vmIp, pawnId) {
+  const raw = await runPsql(vmIp,
+    `SET search_path TO dune, public; ` +
+    `WITH backpacks AS (` +
+    `SELECT id, max_item_count FROM inventories ` +
+    `WHERE actor_id = ${pawnId} AND inventory_type = 0` +
+    `), selected AS (` +
+    `SELECT min(id) AS id, min(max_item_count) AS max_item_count ` +
+    `FROM backpacks HAVING count(*) = 1` +
+    `), item_state AS (` +
+    `SELECT count(i.id)::integer AS item_count, ` +
+    `count(DISTINCT i.position_index)::integer AS distinct_positions, ` +
+    `COALESCE(bool_and(i.position_index >= 0 AND i.position_index < selected.max_item_count), true) AS positions_valid ` +
+    `FROM selected LEFT JOIN items i ON i.inventory_id = selected.id ` +
+    `GROUP BY selected.max_item_count` +
+    `) SELECT json_build_object(` +
+    `'backpackCount', (SELECT count(*) FROM backpacks), ` +
+    `'backpackId', (SELECT id FROM selected), ` +
+    `'capacity', (SELECT max_item_count FROM selected), ` +
+    `'itemCount', COALESCE((SELECT item_count FROM item_state), 0), ` +
+    `'distinctPositions', COALESCE((SELECT distinct_positions FROM item_state), 0), ` +
+    `'positionsValid', COALESCE((SELECT positions_valid FROM item_state), true)` +
+    `)::text`
+  );
+  const line = raw.trim().split(/\r?\n/).find((value) => value.trim().startsWith('{'));
+  if (!line) throw new Error('Backpack capacity preflight did not return a result.');
+  const state = JSON.parse(line);
+  const backpackCount = Number(state.backpackCount);
+  if (backpackCount === 0) {
+    throw new Error(`Backpack inventory was not found for character ${pawnId}.`);
+  }
+  if (backpackCount !== 1 || !Number.isSafeInteger(Number(state.backpackId))) {
+    throw new Error(`Multiple Backpack inventories were found for character ${pawnId}; offline creation was refused.`);
+  }
+  const capacity = Number(state.capacity);
+  const itemCount = Number(state.itemCount);
+  const distinctPositions = Number(state.distinctPositions);
+  if (!Number.isSafeInteger(capacity) || capacity <= 0) {
+    throw new Error('The selected character has an invalid Backpack capacity.');
+  }
+  if (itemCount !== distinctPositions || state.positionsValid !== true) {
+    throw new Error('The Backpack has duplicate or out-of-range positions; offline creation was refused.');
+  }
+  if (itemCount >= capacity) {
+    throw new Error('The selected character\'s Backpack is full.');
+  }
+  return { backpackId: Number(state.backpackId), capacity, itemCount };
+}
+
+app.get('/api/online-actions/catalog', (_req, res) => {
+  try {
+    const catalog = readOnlineActionCatalog();
+    const confirmedAugmentIds = reviewedBulkAugmentIds(catalog);
+    res.json({
+      skillModules: catalog.skillModules,
+      bulkTrainingActions: REVIEWED_BULK_TRAINING_ACTIONS,
+      limits: ONLINE_ACTION_LIMITS,
+      itemTemplateCount: Object.keys(catalog.itemTemplates).length,
+      confirmedAugmentCount: confirmedAugmentIds.length,
+      excludedPackageOnlyAugmentCount: REVIEWED_PACKAGE_ONLY_AUGMENT_COUNT,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/characters/:id/online-actions', async (req, res) => {
+  const ip = await getVmIp();
+  if (!ip) return res.status(400).json({ error: 'VM not running' });
+  const pawnId = parsePawnId(req.params.id);
+  if (!pawnId) return res.status(400).json({ error: 'Invalid character id' });
+  if (onlineActionLocks.has(pawnId)) {
+    return res.status(409).json({ error: 'Another online action for this character is still being sent.' });
+  }
+
+  onlineActionLocks.add(pawnId);
+  try {
+    const body = req.body || {};
+    const action = String(body.action || '').trim();
+
+    if (action === 'grant-solari') {
+      const amount = boundedInteger(body.amount, 'Solari amount', ONLINE_ACTION_LIMITS.solari.min, ONLINE_ACTION_LIMITS.solari.max);
+      const target = await requireOnlineCommandTarget(ip, pawnId);
+      const publish = await publishServerCommand(ip, {
+        ServerCommand: 'AddItemToInventory',
+        PlayerId: target.flsId,
+        ItemName: 'SolarisCoin',
+        Quantity: amount,
+        Durability: 1,
+      });
+      log(`${amount} carried Solari queued for online character ${pawnId}.\n`);
+      return res.status(202).json({
+        success: true,
+        action,
+        amount,
+        queued: publish.queued,
+        brokerAccepted: publish.queued,
+        command: publish.command,
+        delivery: 'game-message-broker',
+        message: `${amount.toLocaleString()} carried Solari was accepted by the game message broker. Check the character's inventory in-game to confirm it was applied.`,
+      });
+    }
+
+    const target = await requireOnlineCommandTarget(ip, pawnId);
+    const catalog = readOnlineActionCatalog();
+    let inner;
+    let description;
+
+    switch (action) {
+      case 'award-xp': {
+        const categories = new Set(['Combat', 'Exploration', 'Science']);
+        const category = String(body.category || '');
+        if (!categories.has(category)) throw new Error('XP category must be Combat, Exploration, or Science.');
+        const amount = boundedInteger(body.amount, 'XP amount', ONLINE_ACTION_LIMITS.xp.min, ONLINE_ACTION_LIMITS.xp.max);
+        inner = { ServerCommand: 'AwardXP', PlayerId: target.flsId, Category: category, Experience: amount };
+        description = `Award ${amount.toLocaleString()} ${category} XP`;
+        break;
+      }
+      case 'set-skill-points': {
+        const points = boundedInteger(body.points, 'Skill points', ONLINE_ACTION_LIMITS.skillPoints.min, ONLINE_ACTION_LIMITS.skillPoints.max);
+        inner = { ServerCommand: 'SkillsSetUnspentSkillPoints', PlayerId: target.flsId, SkillPoints: points };
+        description = `Set unspent skill points to ${points.toLocaleString()}`;
+        break;
+      }
+      case 'set-skill-module': {
+        const moduleId = String(body.moduleId || '').trim();
+        const module = catalog.skillModules.find((entry) => entry.id === moduleId);
+        if (!module) throw new Error('Select a skill module from the reviewed catalog.');
+        const level = boundedInteger(body.level, 'Module level', 0, Number(module.maxLevel));
+        inner = { ServerCommand: 'SkillsSetModuleLevel', PlayerId: target.flsId, Module: module.id, Level: level };
+        description = `Set ${module.name} to level ${level}`;
+        break;
+      }
+      case 'give-item': {
+        const templateId = String(body.templateId || '').trim();
+        if (!Object.prototype.hasOwnProperty.call(catalog.itemTemplates, templateId)) {
+          throw new Error('Select an item from the reviewed item catalog.');
+        }
+        const catalogItem = catalog.itemTemplates[templateId];
+        if (catalogItem.packageOnly === true && body.confirmPackageOnly !== true) {
+          throw new Error('This package-only augment requires explicit experimental confirmation.');
+        }
+        const count = boundedInteger(body.count, 'Item count', ONLINE_ACTION_LIMITS.itemCount.min, ONLINE_ACTION_LIMITS.itemCount.max);
+        if (catalogItem.category === 'Augments' && count !== 1) {
+          throw new Error('Reviewed augment templates can only be granted one at a time.');
+        }
+        const durability = boundedNumber(body.durability, 'Durability', ONLINE_ACTION_LIMITS.itemDurability.min, ONLINE_ACTION_LIMITS.itemDurability.max);
+        inner = { ServerCommand: 'AddItemToInventory', PlayerId: target.flsId, ItemName: templateId, Quantity: count, Durability: durability };
+        description = `Give ${count.toLocaleString()} × ${catalog.itemTemplates[templateId].name || templateId}`;
+        break;
+      }
+      case 'grant-all-confirmed-augments': {
+        const batch = buildReviewedBulkAugmentGrant(target.flsId, catalog);
+        const publish = await publishServerCommandBatch(ip, batch.commands);
+        log(`${publish.queuedCount} confirmed augment grants queued for online character ${pawnId}.\n`);
+        return res.status(202).json({
+          success: true,
+          action,
+          brokerAccepted: true,
+          queued: publish.queuedCount,
+          queuedCount: publish.queuedCount,
+          augmentCount: batch.templateIds.length,
+          excludedPackageOnlyCount: REVIEWED_PACKAGE_ONLY_AUGMENT_COUNT,
+          message: `${publish.queuedCount} individual confirmed augment grants were accepted by the game message broker. They were queued, not verified as applied; check the character's inventory or nearby ground in-game. The ${REVIEWED_PACKAGE_ONLY_AUGMENT_COUNT} package-only experimental candidates were not included.`,
+        });
+      }
+      case 'run-training-batch': {
+        const bulkActionId = String(body.bulkActionId || '').trim();
+        const batch = buildReviewedBulkTrainingAction(bulkActionId, target.flsId, catalog);
+        const publish = await publishServerCommandBatch(ip, batch.commands);
+        log(`${batch.description}: ${publish.queuedCount} native commands queued for online character ${pawnId}.\n`);
+        return res.status(202).json({
+          success: true,
+          action,
+          bulkActionId,
+          brokerAccepted: true,
+          queued: publish.queuedCount,
+          queuedCount: publish.queuedCount,
+          message: `${batch.description}: ${publish.queuedCount} commands were accepted by the game message broker. Check in-game to confirm they were applied.`,
+        });
+      }
+      default:
+        return res.status(400).json({ error: 'Unsupported online action' });
+    }
+
+    const publish = await publishServerCommand(ip, inner);
+    log(`${description} queued for online character ${pawnId}.\n`);
+    return res.status(202).json({
+      success: true,
+      action,
+      brokerAccepted: true,
+      queued: publish.queued,
+      command: publish.command,
+      message: `${description} was accepted by the game message broker. This confirms delivery to the queue, not that the game client has applied it yet.`,
+    });
+  } catch (e) {
+    const statusCode = e.statusCode || (/must|select|required|between|unsupported|whole number/i.test(e.message) ? 400 : 500);
+    res.status(statusCode).json({ error: e.message });
+  } finally {
+    onlineActionLocks.delete(pawnId);
+  }
+});
 
 app.get('/api/characters', async (_req, res) => {
   const ip = await getVmIp();
@@ -1198,8 +1915,8 @@ app.get('/api/characters', async (_req, res) => {
 app.get('/api/characters/:id', async (req, res) => {
   const ip = await getVmIp();
   if (!ip) return res.status(400).json({ error: 'VM not running' });
-  const id = parseInt(req.params.id);
-  if (isNaN(id)) return res.status(400).json({ error: 'Invalid ID' });
+  const id = parsePawnId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid ID' });
 
   try {
     const propsRaw = await runPsql(ip, `SELECT properties::text FROM actors WHERE id = ${id}`);
@@ -1212,10 +1929,32 @@ app.get('/api/characters/:id', async (req, res) => {
 
     const itemsRaw = await runPsql(ip,
       `SELECT COALESCE(json_agg(row_to_json(t)), '[]') FROM (` +
-      `SELECT i.id, i.inventory_id, i.template_id, i.stack_size, i.position_index, inv.inventory_type ` +
+      `SELECT i.id, i.inventory_id, i.template_id, i.stack_size, i.position_index, ` +
+      `i.quality_level, inv.inventory_type, ` +
+      `(COALESCE(i.template_id ILIKE '%Augment%', false) AND CASE ` +
+      `WHEN jsonb_typeof(i.stats #> '{FAugmentItemStats,1,StatRolls}') = 'array' ` +
+      `THEN jsonb_array_length(i.stats #> '{FAugmentItemStats,1,StatRolls}') > 0 ` +
+      `ELSE false END) AS augment_eligible, ` +
+      `(CASE WHEN i.template_id ILIKE '%Augment%' AND ` +
+      `jsonb_typeof(i.stats #> '{FAugmentItemStats,1,StatRolls}') = 'array' ` +
+      `THEN (SELECT COALESCE(sum(CASE WHEN jsonb_typeof(roll.value) = 'number' ` +
+      `THEN CASE WHEN roll.value::numeric > 0 THEN 1 ELSE 0 END ELSE 0 END), 0)::integer ` +
+      `FROM jsonb_array_elements(i.stats #> '{FAugmentItemStats,1,StatRolls}') roll(value)) ` +
+      `ELSE 0 END) ` +
+      `AS augment_roll_count ` +
       `FROM items i JOIN inventories inv ON i.inventory_id = inv.id ` +
       `WHERE inv.actor_id = ${id} ORDER BY inv.inventory_type, i.position_index) t`
     );
+
+    const stateRaw = await runPsql(ip,
+      `SELECT json_build_object(` +
+      `'onlineStatus', ps.online_status::text, ` +
+      `'serverId', ps.server_id, ` +
+      `'controllerId', ps.player_controller_id` +
+      `)::text FROM player_state ps WHERE ps.player_pawn_id = ${id} LIMIT 1`
+    );
+    const stateLine = stateRaw.trim().split(/\r?\n/).find((value) => value.trim().startsWith('{'));
+    const playerState = stateLine ? JSON.parse(stateLine) : { onlineStatus: 'Offline', serverId: null, controllerId: null };
 
     res.json({
       actorId: id,
@@ -1223,6 +1962,7 @@ app.get('/api/characters/:id', async (req, res) => {
       gasAttributes: JSON.parse(gasRaw.trim() || '{}'),
       inventories: JSON.parse(invRaw.trim()) || [],
       items: JSON.parse(itemsRaw.trim()) || [],
+      playerState,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1265,6 +2005,141 @@ app.post('/api/characters/:id/stats', async (req, res) => {
   }
 });
 
+// Create one reviewed standalone augment directly in the selected character's
+// Backpack. This guarded path is intentionally separate from generic item add.
+app.post('/api/characters/:id/inventory/add-augment', async (req, res) => {
+  const ip = await getVmIp();
+  if (!ip) return res.status(400).json({ error: 'VM not running' });
+  const id = parsePawnId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid character id' });
+
+  const body = req.body;
+  if (!body || Array.isArray(body) || typeof body !== 'object') {
+    return res.status(400).json({ error: 'A templateId is required.' });
+  }
+  const bodyKeys = Object.keys(body);
+  if (bodyKeys.length !== 1 || bodyKeys[0] !== 'templateId') {
+    return res.status(400).json({ error: 'Only templateId is accepted for offline augment creation.' });
+  }
+  const templateId = String(body.templateId || '').trim();
+  if (!Object.prototype.hasOwnProperty.call(REVIEWED_OFFLINE_AUGMENTS, templateId)) {
+    return res.status(400).json({ error: 'Select one of the three reviewed offline augment templates.' });
+  }
+  const reviewedAugment = REVIEWED_OFFLINE_AUGMENTS[templateId];
+
+  const statsJson =
+    `{"FAugmentItemStats":[[],{"StatRolls":[${reviewedAugment.seed}]}],` +
+    `"FItemStackAndDurabilityStats":[[],{"MaxDurability":-1.1,"CurrentDurability":-1.1,"DecayedMaxDurability":-1.1}]}`;
+
+  try {
+    await requireStoppedOfflineCharacter(ip, id);
+    await requireCharacterBackpackCapacity(ip, id);
+    const backup = await backupBeforeCharacterMutation(ip);
+    await requireStoppedOfflineCharacter(ip, id);
+
+    const raw = await runPsql(ip,
+      `BEGIN; ` +
+      `SET LOCAL search_path TO dune, public; ` +
+      offlineCharacterGuardSql(id) +
+      `CREATE TEMP TABLE offline_augment_backpack (` +
+      `inventory_id bigint PRIMARY KEY, max_item_count integer NOT NULL, position_index integer` +
+      `) ON COMMIT DROP; ` +
+      `INSERT INTO offline_augment_backpack (inventory_id, max_item_count) ` +
+      `SELECT inv.id, inv.max_item_count FROM inventories inv ` +
+      `WHERE inv.actor_id = ${id} AND inv.inventory_type = 0 FOR UPDATE OF inv; ` +
+      `DO $offline_augment_backpack_guard$ ` +
+      `DECLARE item_count integer; distinct_positions integer; invalid_positions integer; backpack_capacity integer; ` +
+      `BEGIN ` +
+      `IF (SELECT count(*) FROM offline_augment_backpack) <> 1 THEN ` +
+      `RAISE EXCEPTION 'Expected exactly one Backpack inventory for character ${id}'; END IF; ` +
+      `SELECT max_item_count INTO backpack_capacity FROM offline_augment_backpack; ` +
+      `IF backpack_capacity IS NULL OR backpack_capacity <= 0 THEN ` +
+      `RAISE EXCEPTION 'The selected character has an invalid Backpack capacity'; END IF; ` +
+      `PERFORM i.id FROM items i JOIN offline_augment_backpack backpack ` +
+      `ON backpack.inventory_id = i.inventory_id ORDER BY i.id FOR UPDATE OF i; ` +
+      `SELECT count(*)::integer, count(DISTINCT i.position_index)::integer, ` +
+      `count(*) FILTER (WHERE i.position_index < 0 OR i.position_index >= backpack.max_item_count)::integer ` +
+      `INTO item_count, distinct_positions, invalid_positions ` +
+      `FROM items i JOIN offline_augment_backpack backpack ON backpack.inventory_id = i.inventory_id; ` +
+      `IF item_count <> distinct_positions OR invalid_positions <> 0 THEN ` +
+      `RAISE EXCEPTION 'The Backpack has duplicate or out-of-range positions'; END IF; ` +
+      `IF item_count >= backpack_capacity THEN RAISE EXCEPTION 'The selected character''s Backpack is full'; END IF; ` +
+      `END $offline_augment_backpack_guard$; ` +
+      `UPDATE offline_augment_backpack backpack SET position_index = (` +
+      `SELECT slot FROM generate_series(0, backpack.max_item_count - 1) AS free_slots(slot) ` +
+      `WHERE NOT EXISTS (SELECT 1 FROM items i WHERE i.inventory_id = backpack.inventory_id ` +
+      `AND i.position_index = free_slots.slot) ORDER BY slot LIMIT 1` +
+      `); ` +
+      `DO $offline_augment_slot_guard$ BEGIN ` +
+      `IF (SELECT position_index FROM offline_augment_backpack) IS NULL THEN ` +
+      `RAISE EXCEPTION 'No free Backpack position was found'; END IF; ` +
+      `END $offline_augment_slot_guard$; ` +
+      `CREATE TEMP TABLE offline_augment_inserted (` +
+      `item_id bigint PRIMARY KEY, inventory_id bigint NOT NULL, position_index integer NOT NULL, ` +
+      `acquisition_time bigint NOT NULL` +
+      `) ON COMMIT DROP; ` +
+      `WITH inserted AS (` +
+      `INSERT INTO items (` +
+      `inventory_id, template_id, stack_size, position_index, stats, is_new, acquisition_time, quality_level, volume_override` +
+      `) SELECT backpack.inventory_id, '${templateId}', 1, backpack.position_index, '${statsJson}'::jsonb, ` +
+      `true, extract(epoch FROM clock_timestamp())::bigint, 1, NULL ` +
+      `FROM offline_augment_backpack backpack ` +
+      `RETURNING id, inventory_id, position_index, acquisition_time` +
+      `) INSERT INTO offline_augment_inserted (item_id, inventory_id, position_index, acquisition_time) ` +
+      `SELECT id, inventory_id, position_index, acquisition_time FROM inserted; ` +
+      `DO $offline_augment_verify$ BEGIN ` +
+      `IF (SELECT count(*) FROM offline_augment_inserted) <> 1 THEN ` +
+      `RAISE EXCEPTION 'Offline augment insert row-count verification failed'; END IF; ` +
+      `IF EXISTS (` +
+      `SELECT 1 FROM offline_augment_inserted created ` +
+      `JOIN offline_augment_backpack backpack ON backpack.inventory_id = created.inventory_id ` +
+      `LEFT JOIN items i ON i.id = created.item_id ` +
+      `LEFT JOIN inventories inv ON inv.id = i.inventory_id ` +
+      `WHERE i.id IS NULL OR inv.id IS NULL OR inv.actor_id IS DISTINCT FROM ${id} ` +
+      `OR inv.inventory_type IS DISTINCT FROM 0 ` +
+      `OR i.inventory_id IS DISTINCT FROM backpack.inventory_id ` +
+      `OR i.position_index IS DISTINCT FROM backpack.position_index ` +
+      `OR i.position_index IS DISTINCT FROM created.position_index ` +
+      `OR i.template_id IS DISTINCT FROM '${templateId}' ` +
+      `OR i.stack_size IS DISTINCT FROM 1 OR i.is_new IS DISTINCT FROM true ` +
+      `OR i.acquisition_time IS DISTINCT FROM created.acquisition_time ` +
+      `OR i.quality_level IS DISTINCT FROM 1 OR i.volume_override IS NOT NULL ` +
+      `OR i.stats IS DISTINCT FROM '${statsJson}'::jsonb` +
+      `) THEN RAISE EXCEPTION 'Offline augment readback verification failed'; END IF; ` +
+      `END $offline_augment_verify$; ` +
+      `SELECT json_build_object(` +
+      `'itemId', created.item_id, 'inventoryId', created.inventory_id, ` +
+      `'positionIndex', created.position_index, 'acquisitionTime', created.acquisition_time, ` +
+      `'templateId', '${templateId}', 'qualityLevel', 1, 'verified', true` +
+      `)::text FROM offline_augment_inserted created; ` +
+      `COMMIT;`,
+      { timeout: 120000 }
+    );
+
+    const line = raw.trim().split(/\r?\n/).find((value) => value.trim().startsWith('{'));
+    if (!line) throw new Error('Offline augment creation committed but verified readback was unavailable.');
+    const result = JSON.parse(line);
+    if (!result.verified || result.templateId !== templateId || Number(result.qualityLevel) !== 1 ||
+        !Number.isSafeInteger(Number(result.itemId)) || !Number.isSafeInteger(Number(result.positionIndex))) {
+      throw new Error('Offline augment readback did not match the requested template.');
+    }
+
+    log(`Created one verified ${reviewedAugment.name} in character ${id}'s Backpack.\n`);
+    res.json({
+      success: true,
+      ...result,
+      backup,
+      experimental: reviewedAugment.installedDerived,
+    });
+  } catch (e) {
+    const message = e.message || 'Offline augment creation failed';
+    const statusCode = /not confirmed fully stopped|fully logged out|must be Offline|Backpack is full|No free Backpack|Multiple Backpack|Expected exactly one Backpack|duplicate or out-of-range/i.test(message)
+      ? 409
+      : (/not found/i.test(message) ? 404 : (/invalid|Select one|Only templateId|required/i.test(message) ? 400 : 500));
+    res.status(statusCode).json({ error: message });
+  }
+});
+
 app.post('/api/characters/:id/inventory/add', async (req, res) => {
   const ip = await getVmIp();
   if (!ip) return res.status(400).json({ error: 'VM not running' });
@@ -1275,7 +2150,20 @@ app.post('/api/characters/:id/inventory/add', async (req, res) => {
     return res.status(400).json({ error: 'templateId, stackSize, and inventoryId required' });
   }
 
-  const safeId = templateId.replace(/'/g, "''");
+  const submittedTemplateId = String(templateId).trim();
+  let catalogItem;
+  try {
+    catalogItem = readOnlineActionCatalog().itemTemplates[submittedTemplateId];
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+  if (catalogItem?.category === 'Augments' || /augment/i.test(submittedTemplateId)) {
+    return res.status(400).json({
+      error: 'Augments must use the dedicated reviewed online grant or guarded offline creation action.',
+    });
+  }
+
+  const safeId = submittedTemplateId.replace(/'/g, "''");
   const stats = isEquipment
     ? '{"FCustomizationStats": [[], {}], "FItemStackAndDurabilityStats": [[], {}]}'
     : '{"FItemStackAndDurabilityStats": [[], {"DecayedMaxDurability": 0.0}]}';
@@ -1298,65 +2186,296 @@ app.post('/api/characters/:id/inventory/add', async (req, res) => {
   }
 });
 
+// Max one persisted augment in the selected character's owned inventories.
+// The row and its owning inventory are locked and revalidated inside the write transaction.
+app.post('/api/characters/:id/inventory/:itemId/augment/max', async (req, res) => {
+  const ip = await getVmIp();
+  if (!ip) return res.status(400).json({ error: 'VM not running' });
+  const id = parsePawnId(req.params.id);
+  const itemId = parsePawnId(req.params.itemId);
+  if (!id) return res.status(400).json({ error: 'Invalid character id' });
+  if (!itemId) return res.status(400).json({ error: 'Invalid item id' });
+
+  try {
+    await requireStoppedOfflineCharacter(ip, id);
+    await requireOwnedEligibleAugmentItem(ip, id, itemId);
+    const backup = await backupBeforeCharacterMutation(ip);
+    await requireStoppedOfflineCharacter(ip, id);
+
+    const raw = await runPsql(ip,
+      `BEGIN; ` +
+      `SET LOCAL search_path TO dune, public; ` +
+      offlineCharacterGuardSql(id) +
+      `DO $augment_item_guard$ ` +
+      `DECLARE owner_id bigint; item_template text; item_stats jsonb; ` +
+      `BEGIN ` +
+      `SELECT inv.actor_id, i.template_id, i.stats ` +
+      `INTO owner_id, item_template, item_stats ` +
+      `FROM items i JOIN inventories inv ON inv.id = i.inventory_id ` +
+      `WHERE i.id = ${itemId} FOR UPDATE OF i, inv; ` +
+      `IF NOT FOUND THEN RAISE EXCEPTION 'Item ${itemId} was not found'; END IF; ` +
+      `IF owner_id IS DISTINCT FROM ${id} THEN ` +
+      `RAISE EXCEPTION 'Item ${itemId} is not owned by character ${id}'; END IF; ` +
+      `IF (item_template ILIKE '%Augment%') IS NOT TRUE THEN ` +
+      `RAISE EXCEPTION 'Item ${itemId} is not a supported augment'; END IF; ` +
+      `IF (CASE WHEN jsonb_typeof(item_stats #> '{FAugmentItemStats,1,StatRolls}') = 'array' ` +
+      `THEN jsonb_array_length(item_stats #> '{FAugmentItemStats,1,StatRolls}') > 0 ` +
+      `ELSE false END) IS NOT TRUE THEN ` +
+      `RAISE EXCEPTION 'Item ${itemId} has no supported augment roll array'; END IF; ` +
+      `END $augment_item_guard$; ` +
+      `CREATE TEMP TABLE augment_item_target (` +
+      `item_id bigint PRIMARY KEY, inventory_id bigint NOT NULL, expected_rolls jsonb NOT NULL, ` +
+      `numeric_rolls integer NOT NULL, changed_rolls integer NOT NULL, grade_changed integer NOT NULL` +
+      `) ON COMMIT DROP; ` +
+      `INSERT INTO augment_item_target ` +
+      `(item_id, inventory_id, expected_rolls, numeric_rolls, changed_rolls, grade_changed) ` +
+      `SELECT i.id, i.inventory_id, ` +
+      `(SELECT jsonb_agg(CASE ` +
+      `WHEN jsonb_typeof(roll.value) <> 'number' THEN roll.value ` +
+      `WHEN roll.value::numeric <= 0 THEN roll.value ` +
+      `ELSE to_jsonb(1.003398::numeric) END ORDER BY roll.ordinality) ` +
+      `FROM jsonb_array_elements(i.stats #> '{FAugmentItemStats,1,StatRolls}') ` +
+      `WITH ORDINALITY AS roll(value, ordinality)), ` +
+      `(SELECT COALESCE(sum(CASE WHEN jsonb_typeof(roll.value) = 'number' ` +
+      `THEN CASE WHEN roll.value::numeric > 0 THEN 1 ELSE 0 END ELSE 0 END), 0)::integer ` +
+      `FROM jsonb_array_elements(i.stats #> '{FAugmentItemStats,1,StatRolls}') roll(value)), ` +
+      `(SELECT COALESCE(sum(CASE WHEN jsonb_typeof(roll.value) = 'number' ` +
+      `THEN CASE WHEN roll.value::numeric > 0 AND roll.value::numeric <> 1.003398::numeric ` +
+      `THEN 1 ELSE 0 END ELSE 0 END), 0)::integer ` +
+      `FROM jsonb_array_elements(i.stats #> '{FAugmentItemStats,1,StatRolls}') roll(value)), ` +
+      `CASE WHEN i.quality_level IS DISTINCT FROM 5 THEN 1 ELSE 0 END ` +
+      `FROM items i JOIN inventories inv ON inv.id = i.inventory_id ` +
+      `WHERE i.id = ${itemId} AND inv.actor_id = ${id} ` +
+      `AND i.template_id ILIKE '%Augment%' ` +
+      `AND CASE WHEN jsonb_typeof(i.stats #> '{FAugmentItemStats,1,StatRolls}') = 'array' ` +
+      `THEN jsonb_array_length(i.stats #> '{FAugmentItemStats,1,StatRolls}') > 0 ELSE false END; ` +
+      `CREATE TEMP TABLE augment_item_updated (item_id bigint PRIMARY KEY) ON COMMIT DROP; ` +
+      `WITH updated AS (` +
+      `UPDATE items i SET ` +
+      `stats = jsonb_set(i.stats, '{FAugmentItemStats,1,StatRolls}', target.expected_rolls, false), ` +
+      `quality_level = 5 ` +
+      `FROM augment_item_target target ` +
+      `WHERE i.id = target.item_id AND i.inventory_id = target.inventory_id RETURNING i.id` +
+      `) INSERT INTO augment_item_updated (item_id) SELECT id FROM updated; ` +
+      `DO $augment_item_verify$ BEGIN ` +
+      `IF (SELECT count(*) FROM augment_item_target) <> 1 ` +
+      `OR (SELECT count(*) FROM augment_item_updated) <> 1 THEN ` +
+      `RAISE EXCEPTION 'Single augment row-count verification failed'; END IF; ` +
+      `IF EXISTS (` +
+      `SELECT 1 FROM augment_item_target target ` +
+      `LEFT JOIN items i ON i.id = target.item_id ` +
+      `LEFT JOIN inventories inv ON inv.id = i.inventory_id ` +
+      `WHERE i.id IS NULL OR inv.id IS NULL OR inv.actor_id IS DISTINCT FROM ${id} ` +
+      `OR i.inventory_id IS DISTINCT FROM target.inventory_id ` +
+      `OR (i.template_id ILIKE '%Augment%') IS NOT TRUE ` +
+      `OR i.quality_level IS DISTINCT FROM 5 ` +
+      `OR i.stats #> '{FAugmentItemStats,1,StatRolls}' IS DISTINCT FROM target.expected_rolls` +
+      `) THEN RAISE EXCEPTION 'Single augment readback verification failed'; END IF; ` +
+      `END $augment_item_verify$; ` +
+      `SELECT json_build_object(` +
+      `'itemId', (SELECT item_id FROM augment_item_target), ` +
+      `'updatedItems', (SELECT count(*) FROM augment_item_updated), ` +
+      `'numericAttributes', (SELECT numeric_rolls FROM augment_item_target), ` +
+      `'changedAttributes', (SELECT changed_rolls FROM augment_item_target), ` +
+      `'gradeChanges', (SELECT grade_changed FROM augment_item_target), ` +
+      `'qualityLevel', 5, 'maxValue', 1.003398, 'verified', true` +
+      `)::text; ` +
+      `COMMIT;`,
+      { timeout: 120000 }
+    );
+
+    const line = raw.trim().split(/\r?\n/).find((value) => value.trim().startsWith('{'));
+    if (!line) throw new Error('Augment update committed but verified readback was unavailable.');
+    const result = JSON.parse(line);
+    if (!result.verified || Number(result.itemId) !== itemId || Number(result.updatedItems) !== 1 ||
+        Number(result.qualityLevel) !== 5) {
+      throw new Error('Augment readback did not match the selected item.');
+    }
+
+    log(`Verified maximum augment attributes and Grade 5 for item ${itemId} owned by character ${id}.\n`);
+    res.json({ success: true, ...result, backup });
+  } catch (e) {
+    const message = e.message || 'Augment item update failed';
+    const statusCode = /not confirmed fully stopped|fully logged out|must be Offline/i.test(message)
+      ? 409
+      : (/not found|not owned/i.test(message) ? 404 : (/not a supported.*augment|no supported augment/i.test(message) ? 400 : 500));
+    res.status(statusCode).json({ error: message });
+  }
+});
+
+// Max every confirmed positive numeric roll and set Grade 5 for supported augments
+// in this character's owned inventories. Sentinels and non-numeric entries are preserved.
+app.post('/api/characters/:id/augments/max-attributes', async (req, res) => {
+  const ip = await getVmIp();
+  if (!ip) return res.status(400).json({ error: 'VM not running' });
+  const id = parsePawnId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid character id' });
+
+  try {
+    await requireStoppedOfflineCharacter(ip, id);
+    const backup = await backupBeforeCharacterMutation(ip);
+    await requireStoppedOfflineCharacter(ip, id);
+
+    const raw = await runPsql(ip,
+      `BEGIN; ` +
+      `SET LOCAL search_path TO dune, public; ` +
+      offlineCharacterGuardSql(id) +
+      `CREATE TEMP TABLE augment_attribute_targets (` +
+      `item_id bigint PRIMARY KEY, expected_rolls jsonb NOT NULL, ` +
+      `numeric_rolls integer NOT NULL, changed_rolls integer NOT NULL, ` +
+      `grade_changed integer NOT NULL` +
+      `) ON COMMIT DROP; ` +
+      `INSERT INTO augment_attribute_targets ` +
+      `(item_id, expected_rolls, numeric_rolls, changed_rolls, grade_changed) ` +
+      `SELECT i.id, ` +
+      `(SELECT jsonb_agg(CASE ` +
+      `WHEN jsonb_typeof(roll.value) <> 'number' THEN roll.value ` +
+      `WHEN roll.value::numeric <= 0 THEN roll.value ` +
+      `ELSE to_jsonb(1.003398::numeric) END ORDER BY roll.ordinality) ` +
+      `FROM jsonb_array_elements(i.stats #> '{FAugmentItemStats,1,StatRolls}') ` +
+      `WITH ORDINALITY AS roll(value, ordinality)), ` +
+      `(SELECT COALESCE(sum(CASE WHEN jsonb_typeof(roll.value) = 'number' ` +
+      `THEN CASE WHEN roll.value::numeric > 0 THEN 1 ELSE 0 END ELSE 0 END), 0)::integer ` +
+      `FROM jsonb_array_elements(i.stats #> '{FAugmentItemStats,1,StatRolls}') roll(value)), ` +
+      `(SELECT COALESCE(sum(CASE WHEN jsonb_typeof(roll.value) = 'number' ` +
+      `THEN CASE WHEN roll.value::numeric > 0 AND roll.value::numeric <> 1.003398::numeric ` +
+      `THEN 1 ELSE 0 END ELSE 0 END), 0)::integer ` +
+      `FROM jsonb_array_elements(i.stats #> '{FAugmentItemStats,1,StatRolls}') roll(value)), ` +
+      `CASE WHEN i.quality_level IS DISTINCT FROM 5 THEN 1 ELSE 0 END ` +
+      `FROM items i JOIN inventories inv ON inv.id = i.inventory_id ` +
+      `WHERE inv.actor_id = ${id} ` +
+      `AND i.template_id ILIKE '%Augment%' ` +
+      `AND CASE WHEN jsonb_typeof(i.stats #> '{FAugmentItemStats,1,StatRolls}') = 'array' ` +
+      `THEN jsonb_array_length(i.stats #> '{FAugmentItemStats,1,StatRolls}') > 0 ELSE false END ` +
+      `FOR UPDATE OF i, inv; ` +
+      `CREATE TEMP TABLE augment_attribute_updated (` +
+      `item_id bigint PRIMARY KEY` +
+      `) ON COMMIT DROP; ` +
+      `WITH updated AS (` +
+      `UPDATE items i SET ` +
+      `stats = jsonb_set(i.stats, '{FAugmentItemStats,1,StatRolls}', target.expected_rolls, false), ` +
+      `quality_level = 5 ` +
+      `FROM augment_attribute_targets target WHERE i.id = target.item_id RETURNING i.id` +
+      `) INSERT INTO augment_attribute_updated (item_id) SELECT id FROM updated; ` +
+      `DO $augment_verify$ BEGIN ` +
+      `IF (SELECT count(*) FROM augment_attribute_updated) <> ` +
+      `(SELECT count(*) FROM augment_attribute_targets) THEN ` +
+      `RAISE EXCEPTION 'Augment row-count verification failed'; END IF; ` +
+      `IF EXISTS (` +
+      `SELECT 1 FROM augment_attribute_targets target ` +
+      `LEFT JOIN items i ON i.id = target.item_id ` +
+      `LEFT JOIN inventories inv ON inv.id = i.inventory_id ` +
+      `WHERE i.id IS NULL OR inv.actor_id IS DISTINCT FROM ${id} ` +
+      `OR (i.template_id ILIKE '%Augment%') IS NOT TRUE ` +
+      `OR i.quality_level IS DISTINCT FROM 5 ` +
+      `OR i.stats #> '{FAugmentItemStats,1,StatRolls}' IS DISTINCT FROM target.expected_rolls` +
+      `) THEN RAISE EXCEPTION 'Augment attribute readback verification failed'; END IF; ` +
+      `END $augment_verify$; ` +
+      `SELECT json_build_object(` +
+      `'eligibleItems', (SELECT count(*) FROM augment_attribute_targets), ` +
+      `'updatedItems', (SELECT count(*) FROM augment_attribute_updated), ` +
+      `'numericAttributes', (SELECT COALESCE(sum(numeric_rolls), 0) FROM augment_attribute_targets), ` +
+      `'changedAttributes', (SELECT COALESCE(sum(changed_rolls), 0) FROM augment_attribute_targets), ` +
+      `'gradeChanges', (SELECT COALESCE(sum(grade_changed), 0) FROM augment_attribute_targets), ` +
+      `'qualityLevel', 5, 'maxValue', 1.003398, 'verified', true` +
+      `)::text; ` +
+      `COMMIT;`,
+      { timeout: 120000 }
+    );
+
+    const line = raw.trim().split(/\r?\n/).find((value) => value.trim().startsWith('{'));
+    if (!line) throw new Error('Augment update committed but verified readback was unavailable.');
+    const result = JSON.parse(line);
+    if (!result.verified || Number(result.updatedItems) !== Number(result.eligibleItems)) {
+      throw new Error('Augment attribute readback did not match the targeted item count.');
+    }
+
+    log(`Verified maximum augment attributes and Grade 5 for ${result.updatedItems} item(s) owned by character ${id}.\n`);
+    res.json({ success: true, ...result, backup });
+  } catch (e) {
+    const message = e.message || 'Augment attribute update failed';
+    const statusCode = /not confirmed fully stopped|fully logged out|must be Offline/i.test(message)
+      ? 409
+      : (/not found/i.test(message) ? 404 : 500);
+    res.status(statusCode).json({ error: message });
+  }
+});
+
 // Unlock all tech tree recipes
 app.post('/api/characters/:id/tech/unlock-all', async (req, res) => {
   const ip = await getVmIp();
   if (!ip) return res.status(400).json({ error: 'VM not running' });
-  const id = parseInt(req.params.id);
+  const id = parsePawnId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid character id' });
 
   try {
-    const catalogIds = loadTechRecipeCatalogIds();
+    await requireStoppedOfflineCharacter(ip, id);
+    const backup = await backupBeforeCharacterMutation(ip);
+    await requireStoppedOfflineCharacter(ip, id);
     const raw = await runPsql(ip,
-      `SELECT COALESCE(properties->'TechKnowledgePlayerComponent'->'m_TechKnowledge'->'m_TechKnowledgeData', '[]'::jsonb) ` +
-      `FROM actors WHERE id = ${id}`
-    );
-    const current = JSON.parse(raw.trim()) || [];
-    const byKey = new Map();
-
-    for (const entry of current) {
-      const key = entry?.ItemKey;
-      if (!key) continue;
-      byKey.set(key, {
-        ...entry,
-        ItemKey: key,
-        bIsNewEntry: false,
-        UnlockedState: 'Purchased',
-      });
-    }
-
-    for (const itemKey of catalogIds) {
-      if (byKey.has(itemKey)) {
-        const entry = byKey.get(itemKey);
-        entry.UnlockedState = 'Purchased';
-        entry.bIsNewEntry = false;
-      } else {
-        byKey.set(itemKey, {
-          ItemKey: itemKey,
-          bIsNewEntry: false,
-          UnlockedState: 'Purchased',
-        });
-      }
-    }
-
-    const merged = [...byKey.values()].sort((a, b) =>
-      String(a.ItemKey).localeCompare(String(b.ItemKey))
-    );
-    const payload = JSON.stringify(merged).replace(/'/g, "''");
-
-    await runPsql(ip,
-      `UPDATE actors SET properties = jsonb_set(` +
-      `jsonb_set(properties, '{TechKnowledgePlayerComponent,m_TechKnowledgePoints}', '99999'), ` +
-      `'{TechKnowledgePlayerComponent,m_TechKnowledge,m_TechKnowledgeData}', '${payload}'::jsonb` +
-      `) WHERE id = ${id}`,
+      `BEGIN; ` +
+      `SET LOCAL search_path TO dune, public; ` +
+      offlineCharacterGuardSql(id) +
+      `DO $tech_unlock$ ` +
+      `DECLARE actor_props jsonb; tech_entries jsonb; recipe_entries jsonb; ` +
+      `tech_entry jsonb; item_key text; recipe_id text; ` +
+      `BEGIN ` +
+      `SELECT properties INTO actor_props FROM actors WHERE id = ${id} FOR UPDATE; ` +
+      `IF actor_props IS NULL THEN RAISE EXCEPTION 'Character actor ${id} was not found'; END IF; ` +
+      `SELECT COALESCE(jsonb_agg(` +
+      `jsonb_set(jsonb_set(entry, '{UnlockedState}', '"Purchased"'::jsonb), ` +
+      `'{bIsNewEntry}', 'false'::jsonb)), '[]'::jsonb) INTO tech_entries ` +
+      `FROM jsonb_array_elements(COALESCE(actor_props #> ` +
+      `'{TechKnowledgePlayerComponent,m_TechKnowledge,m_TechKnowledgeData}', '[]'::jsonb)) entry; ` +
+      `recipe_entries := COALESCE(actor_props #> ` +
+      `'{CraftingRecipesLibraryActorComponent,m_KnownItemRecipes}', '[]'::jsonb); ` +
+      `FOR tech_entry IN SELECT value FROM jsonb_array_elements(tech_entries) LOOP ` +
+      `item_key := tech_entry->>'ItemKey'; recipe_id := NULL; ` +
+      `IF left(item_key, 4) = 'RCP_' THEN recipe_id := substring(item_key from 5); ` +
+      `ELSIF left(item_key, 4) = 'BLD_' THEN recipe_id := substring(item_key from 5); ` +
+      `IF right(recipe_id, 7) <> '_Patent' THEN recipe_id := recipe_id || '_Patent'; END IF; END IF; ` +
+      `IF recipe_id IS NOT NULL ` +
+      `AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(recipe_entries) r ` +
+      `WHERE r->'BaseRecipeId'->>'Name' = recipe_id) ` +
+      `AND EXISTS (SELECT 1 FROM actors candidate CROSS JOIN LATERAL ` +
+      `jsonb_array_elements(COALESCE(candidate.properties #> ` +
+      `'{CraftingRecipesLibraryActorComponent,m_KnownItemRecipes}', '[]'::jsonb)) observed ` +
+      `WHERE observed->'BaseRecipeId'->>'Name' = recipe_id) THEN ` +
+      `recipe_entries := recipe_entries || jsonb_build_array(jsonb_build_object(` +
+      `'m_Source', 'SchematicPickup', 'm_bIsNew', true, ` +
+      `'BaseRecipeId', jsonb_build_object('Name', recipe_id), ` +
+      `'m_QualityLevel', 0, 'm_NumberOfRecipeUses', 0, 'm_bIsLimitedUseRecipe', false)); ` +
+      `END IF; END LOOP; ` +
+      `actor_props := jsonb_set(jsonb_set(jsonb_set(actor_props, ` +
+      `'{TechKnowledgePlayerComponent,m_TechKnowledgePoints}', '2779'::jsonb, true), ` +
+      `'{TechKnowledgePlayerComponent,m_TechKnowledge,m_TechKnowledgeData}', tech_entries, true), ` +
+      `'{CraftingRecipesLibraryActorComponent,m_KnownItemRecipes}', recipe_entries, true); ` +
+      `UPDATE actors SET properties = actor_props WHERE id = ${id}; ` +
+      `IF NOT FOUND THEN RAISE EXCEPTION 'Character actor ${id} changed concurrently'; END IF; ` +
+      `IF EXISTS (SELECT 1 FROM jsonb_array_elements(tech_entries) e ` +
+      `WHERE e->>'UnlockedState' <> 'Purchased') THEN ` +
+      `RAISE EXCEPTION 'Tech unlock verification failed'; END IF; ` +
+      `END $tech_unlock$; ` +
+      `COMMIT; ` +
+      `SELECT json_build_object(` +
+      `'total', jsonb_array_length(properties #> ` +
+      `'{TechKnowledgePlayerComponent,m_TechKnowledge,m_TechKnowledgeData}'), ` +
+      `'knownRecipes', jsonb_array_length(properties #> ` +
+      `'{CraftingRecipesLibraryActorComponent,m_KnownItemRecipes}')` +
+      `)::text FROM actors WHERE id = ${id};`,
       { timeout: 120000 }
     );
-    log(`All ${merged.length} tech tree recipes unlocked for character ${id} (+${merged.length - current.length} added).\n`);
+    const summaryLine = raw.trim().split(/\r?\n/).reverse().find((line) => line.trim().startsWith('{'));
+    if (!summaryLine) throw new Error('Tech unlock completed without a verification summary.');
+    const summary = JSON.parse(summaryLine);
+    log(`All ${summary.total} game-created tech entries unlocked for character ${id}; ${summary.knownRecipes} known recipes verified.\n`);
     res.json({
       success: true,
-      total: merged.length,
-      added: merged.length - current.length,
-      previous: current.length,
-      catalogTotal: catalogIds.length,
+      total: summary.total,
+      knownRecipes: summary.knownRecipes,
+      added: 0,
+      safeMode: true,
+      backup,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1367,18 +2486,30 @@ app.post('/api/characters/:id/tech/unlock-all', async (req, res) => {
 app.post('/api/characters/:id/tech/lock-all', async (req, res) => {
   const ip = await getVmIp();
   if (!ip) return res.status(400).json({ error: 'VM not running' });
-  const id = parseInt(req.params.id);
+  const id = parsePawnId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid character id' });
 
   try {
+    await requireStoppedOfflineCharacter(ip, id);
+    const backup = await backupBeforeCharacterMutation(ip);
+    await requireStoppedOfflineCharacter(ip, id);
     await runPsql(ip,
+      `BEGIN; SET LOCAL search_path TO dune, public; ` +
+      offlineCharacterGuardSql(id) +
+      `SELECT id FROM actors WHERE id = ${id} FOR UPDATE; ` +
       `UPDATE actors SET properties = jsonb_set(` +
       `properties, '{TechKnowledgePlayerComponent,m_TechKnowledge,m_TechKnowledgeData}', ` +
       `(SELECT jsonb_agg(jsonb_set(elem, '{UnlockedState}', '"NotPurchased"')) ` +
       `FROM jsonb_array_elements(properties->'TechKnowledgePlayerComponent'->'m_TechKnowledge'->'m_TechKnowledgeData') as elem)` +
-      `) WHERE id = ${id}`
+      `) WHERE id = ${id}; ` +
+      `DO $verify$ BEGIN IF EXISTS (` +
+      `SELECT 1 FROM actors a CROSS JOIN LATERAL jsonb_array_elements(` +
+      `a.properties #> '{TechKnowledgePlayerComponent,m_TechKnowledge,m_TechKnowledgeData}') e ` +
+      `WHERE a.id = ${id} AND e->>'UnlockedState' <> 'NotPurchased') THEN ` +
+      `RAISE EXCEPTION 'Tech lock verification failed'; END IF; END $verify$; COMMIT;`
     );
     log(`All tech tree recipes locked for character ${id}.\n`);
-    res.json({ success: true });
+    res.json({ success: true, backup });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1407,21 +2538,39 @@ app.get('/api/characters/:id/cosmetics', async (req, res) => {
 app.post('/api/characters/:id/cosmetics/add', async (req, res) => {
   const ip = await getVmIp();
   if (!ip) return res.status(400).json({ error: 'VM not running' });
-  const id = parseInt(req.params.id);
+  const id = parsePawnId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid character id' });
   const { cosmeticId } = req.body;
   if (!cosmeticId) return res.status(400).json({ error: 'cosmeticId required' });
 
-  const safe = cosmeticId.replace(/[^a-zA-Z0-9_ ]/g, '');
+  const safe = String(cosmeticId);
+  if (!loadCosmeticCatalogIds().includes(safe)) {
+    return res.status(400).json({ error: 'Cosmetic ID is not in the reviewed persisted-data catalog.' });
+  }
   try {
+    await requireStoppedOfflineCharacter(ip, id);
+    const backup = await backupBeforeCharacterMutation(ip);
+    await requireStoppedOfflineCharacter(ip, id);
     await runPsql(ip,
+      `BEGIN; SET LOCAL search_path TO dune, public; ` +
+      offlineCharacterGuardSql(id) +
+      `SELECT id FROM actors WHERE id = ${id} FOR UPDATE; ` +
       `UPDATE actors SET properties = jsonb_set(properties, ` +
       `'{CustomizationLibraryActorComponent,m_UnlockedCustomizationSerializableList,m_UnlockedCustomizationIds}', ` +
       `(properties->'CustomizationLibraryActorComponent'->'m_UnlockedCustomizationSerializableList'->'m_UnlockedCustomizationIds') ` +
       `|| '[{"m_CustomizationId": "${safe.replace(/'/g, "''")}"}]'::jsonb` +
-      `) WHERE id = ${id}`
+      `) WHERE id = ${id} AND NOT EXISTS (` +
+      `SELECT 1 FROM jsonb_array_elements(properties->'CustomizationLibraryActorComponent'` +
+      `->'m_UnlockedCustomizationSerializableList'->'m_UnlockedCustomizationIds') elem ` +
+      `WHERE elem->>'m_CustomizationId' = '${safe.replace(/'/g, "''")}'); ` +
+      `DO $verify$ BEGIN IF NOT EXISTS (` +
+      `SELECT 1 FROM actors a CROSS JOIN LATERAL jsonb_array_elements(` +
+      `a.properties #> '{CustomizationLibraryActorComponent,m_UnlockedCustomizationSerializableList,m_UnlockedCustomizationIds}') e ` +
+      `WHERE a.id = ${id} AND e->>'m_CustomizationId' = '${safe.replace(/'/g, "''")}') THEN ` +
+      `RAISE EXCEPTION 'Cosmetic add verification failed'; END IF; END $verify$; COMMIT;`
     );
     log(`Cosmetic "${safe}" added to character ${id}.\n`);
-    res.json({ success: true });
+    res.json({ success: true, backup });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1431,22 +2580,37 @@ app.post('/api/characters/:id/cosmetics/add', async (req, res) => {
 app.post('/api/characters/:id/cosmetics/remove', async (req, res) => {
   const ip = await getVmIp();
   if (!ip) return res.status(400).json({ error: 'VM not running' });
-  const id = parseInt(req.params.id);
+  const id = parsePawnId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid character id' });
   const { cosmeticId } = req.body;
   if (!cosmeticId) return res.status(400).json({ error: 'cosmeticId required' });
 
-  const safe = cosmeticId.replace(/[^a-zA-Z0-9_ ]/g, '');
+  const safe = String(cosmeticId);
+  if (!loadCosmeticCatalogIds().includes(safe)) {
+    return res.status(400).json({ error: 'Cosmetic ID is not in the reviewed persisted-data catalog.' });
+  }
   try {
+    await requireStoppedOfflineCharacter(ip, id);
+    const backup = await backupBeforeCharacterMutation(ip);
+    await requireStoppedOfflineCharacter(ip, id);
     await runPsql(ip,
+      `BEGIN; SET LOCAL search_path TO dune, public; ` +
+      offlineCharacterGuardSql(id) +
+      `SELECT id FROM actors WHERE id = ${id} FOR UPDATE; ` +
       `UPDATE actors SET properties = jsonb_set(properties, ` +
       `'{CustomizationLibraryActorComponent,m_UnlockedCustomizationSerializableList,m_UnlockedCustomizationIds}', ` +
       `(SELECT COALESCE(jsonb_agg(elem), '[]'::jsonb) FROM jsonb_array_elements(` +
       `properties->'CustomizationLibraryActorComponent'->'m_UnlockedCustomizationSerializableList'->'m_UnlockedCustomizationIds'` +
       `) as elem WHERE elem->>'m_CustomizationId' != '${safe.replace(/'/g, "''")}')` +
-      `) WHERE id = ${id}`
+      `) WHERE id = ${id}; ` +
+      `DO $verify$ BEGIN IF EXISTS (` +
+      `SELECT 1 FROM actors a CROSS JOIN LATERAL jsonb_array_elements(` +
+      `a.properties #> '{CustomizationLibraryActorComponent,m_UnlockedCustomizationSerializableList,m_UnlockedCustomizationIds}') e ` +
+      `WHERE a.id = ${id} AND e->>'m_CustomizationId' = '${safe.replace(/'/g, "''")}') THEN ` +
+      `RAISE EXCEPTION 'Cosmetic remove verification failed'; END IF; END $verify$; COMMIT;`
     );
     log(`Cosmetic "${safe}" removed from character ${id}.\n`);
-    res.json({ success: true });
+    res.json({ success: true, backup });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1461,46 +2625,52 @@ function loadCosmeticCatalogIds() {
     .sort();
 }
 
-function loadTechRecipeCatalogIds() {
-  const catalogPath = path.join(__dirname, 'public', 'data', 'tech-recipe-catalog.json');
-  const data = JSON.parse(fs.readFileSync(catalogPath, 'utf8'));
-  return Object.keys(data.recipes || {}).sort();
-}
-
-function loadTechRecipeCatalogMeta() {
-  const catalogPath = path.join(__dirname, 'public', 'data', 'tech-recipe-catalog.json');
-  const data = JSON.parse(fs.readFileSync(catalogPath, 'utf8'));
-  return { total: data.total || Object.keys(data.recipes || {}).length };
-}
-
 // Unlock all cosmetics from catalog (merge with existing)
 app.post('/api/characters/:id/cosmetics/unlock-all', async (req, res) => {
   const ip = await getVmIp();
   if (!ip) return res.status(400).json({ error: 'VM not running' });
-  const id = parseInt(req.params.id);
+  const id = parsePawnId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid character id' });
 
   try {
+    await requireStoppedOfflineCharacter(ip, id);
+    const backup = await backupBeforeCharacterMutation(ip);
+    await requireStoppedOfflineCharacter(ip, id);
     const catalogIds = loadCosmeticCatalogIds();
+    const catalogPayload = JSON.stringify(catalogIds.map((cid) => ({ m_CustomizationId: cid })))
+      .replace(/'/g, "''");
     const raw = await runPsql(ip,
-      `SELECT COALESCE(json_agg(elem->>'m_CustomizationId' ORDER BY elem->>'m_CustomizationId'), '[]') ` +
-      `FROM (SELECT jsonb_array_elements(properties->'CustomizationLibraryActorComponent'` +
-      `->'m_UnlockedCustomizationSerializableList'->'m_UnlockedCustomizationIds') as elem ` +
-      `FROM actors WHERE id = ${id}) sub`
-    );
-    const current = JSON.parse(raw.trim()) || [];
-    const merged = [...new Set([...current, ...catalogIds])].sort();
-    const payload = JSON.stringify(merged.map((cid) => ({ m_CustomizationId: cid })));
-    const escaped = payload.replace(/'/g, "''");
-
-    await runPsql(ip,
-      `UPDATE actors SET properties = jsonb_set(properties, ` +
+      `BEGIN; SET LOCAL search_path TO dune, public; ` +
+      offlineCharacterGuardSql(id) +
+      `DO $cosmetic_unlock$ ` +
+      `DECLARE actor_props jsonb; current_entries jsonb; catalog_entries jsonb; candidate jsonb; ` +
+      `BEGIN SELECT properties INTO actor_props FROM actors WHERE id = ${id} FOR UPDATE; ` +
+      `IF actor_props IS NULL THEN RAISE EXCEPTION 'Character actor ${id} was not found'; END IF; ` +
+      `current_entries := COALESCE(actor_props #> ` +
+      `'{CustomizationLibraryActorComponent,m_UnlockedCustomizationSerializableList,m_UnlockedCustomizationIds}', '[]'::jsonb); ` +
+      `catalog_entries := '${catalogPayload}'::jsonb; ` +
+      `FOR candidate IN SELECT value FROM jsonb_array_elements(catalog_entries) LOOP ` +
+      `IF NOT EXISTS (SELECT 1 FROM jsonb_array_elements(current_entries) e ` +
+      `WHERE e->>'m_CustomizationId' = candidate->>'m_CustomizationId') THEN ` +
+      `current_entries := current_entries || jsonb_build_array(candidate); END IF; END LOOP; ` +
+      `actor_props := jsonb_set(actor_props, ` +
       `'{CustomizationLibraryActorComponent,m_UnlockedCustomizationSerializableList,m_UnlockedCustomizationIds}', ` +
-      `'${escaped}'::jsonb` +
-      `) WHERE id = ${id}`,
+      `current_entries, true); UPDATE actors SET properties = actor_props WHERE id = ${id}; ` +
+      `IF NOT FOUND THEN RAISE EXCEPTION 'Character actor ${id} changed concurrently'; END IF; ` +
+      `IF EXISTS (SELECT 1 FROM jsonb_array_elements(catalog_entries) c WHERE NOT EXISTS (` +
+      `SELECT 1 FROM jsonb_array_elements(current_entries) e ` +
+      `WHERE e->>'m_CustomizationId' = c->>'m_CustomizationId')) THEN ` +
+      `RAISE EXCEPTION 'Cosmetic bulk verification failed'; END IF; END $cosmetic_unlock$; ` +
+      `COMMIT; SELECT json_build_object('total', jsonb_array_length(properties #> ` +
+      `'{CustomizationLibraryActorComponent,m_UnlockedCustomizationSerializableList,m_UnlockedCustomizationIds}'))::text ` +
+      `FROM actors WHERE id = ${id};`,
       { timeout: 120000 }
     );
-    log(`All ${merged.length} cosmetics unlocked for character ${id}.\n`);
-    res.json({ success: true, total: merged.length, added: merged.length - current.length });
+    const summaryLine = raw.trim().split(/\r?\n/).reverse().find((line) => line.trim().startsWith('{'));
+    if (!summaryLine) throw new Error('Cosmetic unlock completed without a verification summary.');
+    const summary = JSON.parse(summaryLine);
+    log(`All ${summary.total} reviewed cosmetics unlocked for character ${id}.\n`);
+    res.json({ success: true, total: summary.total, backup });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1520,12 +2690,12 @@ app.get('/api/characters/:id/specializations', async (req, res) => {
 
     const tracksRaw = await runPsql(ip,
       `SELECT COALESCE(json_agg(row_to_json(t)), '[]') FROM (` +
-      `SELECT track_type, xp_amount, level FROM specialization_tracks WHERE player_id = ${id} ORDER BY track_type) t`
+      `SELECT track_type, xp_amount, level FROM specialization_tracks WHERE player_id = ${controllerId} ORDER BY track_type) t`
     );
 
     const keystonesRaw = await runPsql(ip,
       `SELECT COALESCE(json_agg(km.name ORDER BY km.id), '[]') FROM purchased_specialization_keystones pk ` +
-      `JOIN specialization_keystones_map km ON pk.keystone_id = km.id WHERE pk.player_id = ${id}`
+      `JOIN specialization_keystones_map km ON pk.keystone_id = km.id WHERE pk.player_id = ${controllerId}`
     );
 
     const allKeystonesRaw = await runPsql(ip,
@@ -1547,20 +2717,37 @@ app.get('/api/characters/:id/specializations', async (req, res) => {
 app.post('/api/characters/:id/specializations/track', async (req, res) => {
   const ip = await getVmIp();
   if (!ip) return res.status(400).json({ error: 'VM not running' });
-  const id = parseInt(req.params.id);
+  const id = parsePawnId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid character id' });
   const { trackType, xp, level } = req.body;
 
   const validTracks = ['Combat', 'Crafting', 'Gathering', 'Exploration', 'Sabotage'];
   if (!validTracks.includes(trackType)) return res.status(400).json({ error: 'Invalid track type' });
+  const parsedXp = Number.parseInt(xp, 10);
+  const parsedLevel = Number.parseFloat(level);
+  if (!Number.isInteger(parsedXp) || parsedXp < 0 || parsedXp > 44182 ||
+      !Number.isFinite(parsedLevel) || parsedLevel < 0 || parsedLevel > 100) {
+    return res.status(400).json({ error: 'XP must be 0-44182 and level must be 0-100.' });
+  }
 
   try {
+    await requireStoppedOfflineCharacter(ip, id);
+    const backup = await backupBeforeCharacterMutation(ip);
+    const player = await requireStoppedOfflineCharacter(ip, id);
+    const controllerId = Number.parseInt(player.controllerId, 10);
+
     await runPsql(ip,
-      `INSERT INTO specialization_tracks (player_id, track_type, xp_amount, level) ` +
-      `VALUES (${id}, '${trackType}', ${parseInt(xp)}, ${parseFloat(level)}) ` +
-      `ON CONFLICT (player_id, track_type) DO UPDATE SET xp_amount = EXCLUDED.xp_amount, level = EXCLUDED.level`
+      `BEGIN; SET LOCAL search_path TO dune, public; ` +
+      offlineCharacterGuardSql(id) +
+      `SELECT set_specialization_xp_and_level(` +
+      `${controllerId}, '${trackType}'::specializationtracktype, ${parsedXp}, ${parsedLevel}); ` +
+      `DO $verify$ BEGIN IF NOT EXISTS (` +
+      `SELECT 1 FROM specialization_tracks WHERE player_id = ${controllerId} ` +
+      `AND track_type::text = '${trackType}' AND xp_amount = ${parsedXp} AND level = ${parsedLevel}) THEN ` +
+      `RAISE EXCEPTION 'Specialization track verification failed'; END IF; END $verify$; COMMIT;`
     );
-    log(`Specialization ${trackType} set to level ${level} for character ${id}.\n`);
-    res.json({ success: true });
+    log(`Specialization ${trackType} set to level ${level} for character ${id} (controller ${controllerId}).\n`);
+    res.json({ success: true, backup });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1570,20 +2757,85 @@ app.post('/api/characters/:id/specializations/track', async (req, res) => {
 app.post('/api/characters/:id/specializations/unlock-keystones', async (req, res) => {
   const ip = await getVmIp();
   if (!ip) return res.status(400).json({ error: 'VM not running' });
-  const id = parseInt(req.params.id);
+  const id = parsePawnId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid character id' });
   const { trackPrefix } = req.body;
 
   const validPrefixes = ['Combat_', 'Crafting_', 'Exploration_', 'Gathering_', 'Sabotage_'];
   if (!validPrefixes.some(p => trackPrefix === p)) return res.status(400).json({ error: 'Invalid track prefix' });
 
   try {
+    await requireStoppedOfflineCharacter(ip, id);
+    const backup = await backupBeforeCharacterMutation(ip);
+    const player = await requireStoppedOfflineCharacter(ip, id);
+    const controllerId = Number.parseInt(player.controllerId, 10);
+
     await runPsql(ip,
+      `BEGIN; SET LOCAL search_path TO dune, public; ` +
+      offlineCharacterGuardSql(id) +
       `INSERT INTO purchased_specialization_keystones (player_id, keystone_id) ` +
-      `SELECT ${id}, id FROM specialization_keystones_map WHERE name LIKE '${trackPrefix}%' ` +
-      `ON CONFLICT DO NOTHING`
+      `SELECT ${controllerId}, id FROM specialization_keystones_map WHERE name LIKE '${trackPrefix}%' ` +
+      `ON CONFLICT DO NOTHING; ` +
+      `DO $verify$ BEGIN IF (` +
+      `SELECT count(*) FROM purchased_specialization_keystones pk JOIN specialization_keystones_map km ` +
+      `ON km.id = pk.keystone_id WHERE pk.player_id = ${controllerId} AND km.name LIKE '${trackPrefix}%') ` +
+      `<> (SELECT count(*) FROM specialization_keystones_map WHERE name LIKE '${trackPrefix}%') THEN ` +
+      `RAISE EXCEPTION 'Keystone verification failed'; END IF; END $verify$; COMMIT;`
     );
-    log(`All ${trackPrefix.replace('_', '')} keystones unlocked for character ${id}.\n`);
-    res.json({ success: true });
+    log(`All ${trackPrefix.replace('_', '')} keystones unlocked for character ${id} (controller ${controllerId}).\n`);
+    res.json({ success: true, backup });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Max every specialization and grant every keystone using the controller row.
+app.post('/api/characters/:id/specializations/max-all', async (req, res) => {
+  const ip = await getVmIp();
+  if (!ip) return res.status(400).json({ error: 'VM not running' });
+  const id = parsePawnId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid character id' });
+
+  try {
+    await requireStoppedOfflineCharacter(ip, id);
+    const backup = await backupBeforeCharacterMutation(ip);
+    const player = await requireStoppedOfflineCharacter(ip, id);
+    const controllerId = Number.parseInt(player.controllerId, 10);
+    const tracks = ['Combat', 'Crafting', 'Gathering', 'Exploration', 'Sabotage'];
+    const calls = tracks.map((track) =>
+      `SELECT set_specialization_xp_and_level(${controllerId}, '${track}'::specializationtracktype, 44182, 100);`
+    ).join(' ');
+    const pawnCleanup = id === controllerId ? '' :
+      `DELETE FROM specialization_tracks WHERE player_id = ${id}; ` +
+      `DELETE FROM purchased_specialization_keystones WHERE player_id = ${id}; `;
+    const pawnCleanupVerification = id === controllerId ? '' :
+      `IF EXISTS (SELECT 1 FROM specialization_tracks WHERE player_id = ${id}) ` +
+      `OR EXISTS (SELECT 1 FROM purchased_specialization_keystones WHERE player_id = ${id}) THEN ` +
+      `RAISE EXCEPTION 'Pawn-id specialization cleanup failed'; END IF; `;
+
+    await runPsql(ip,
+      `BEGIN; ` +
+      `SET LOCAL search_path TO dune, public; ` +
+      offlineCharacterGuardSql(id) +
+      pawnCleanup +
+      calls + ' ' +
+      `INSERT INTO purchased_specialization_keystones (player_id, keystone_id) ` +
+      `SELECT ${controllerId}, id FROM specialization_keystones_map ON CONFLICT DO NOTHING; ` +
+      `DO $verify$ BEGIN ` +
+      `IF (SELECT count(*) FROM specialization_tracks WHERE player_id = ${controllerId} ` +
+      `AND xp_amount = 44182 AND level = 100) <> 5 THEN ` +
+      `RAISE EXCEPTION 'Specialization max verification failed'; END IF; ` +
+      `IF (SELECT count(*) FROM purchased_specialization_keystones WHERE player_id = ${controllerId}) ` +
+      `<> (SELECT count(*) FROM specialization_keystones_map) THEN ` +
+      `RAISE EXCEPTION 'All-keystone verification failed'; END IF; ` +
+      pawnCleanupVerification +
+      `END $verify$; ` +
+      `COMMIT;`,
+      { timeout: 120000 }
+    );
+
+    log(`All specializations maxed and all keystones unlocked for character ${id} (controller ${controllerId}).\n`);
+    res.json({ success: true, controllerId, xp: 44182, level: 100, keystones: 'all', backup });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1632,24 +2884,70 @@ app.get('/api/characters/:id/economy', async (req, res) => {
 app.post('/api/characters/:id/economy/currency', async (req, res) => {
   const ip = await getVmIp();
   if (!ip) return res.status(400).json({ error: 'VM not running' });
-  const id = parseInt(req.params.id);
-  const { currencyId, balance } = req.body;
+  const id = parsePawnId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid character id' });
+
+  const rawCurrencyId = req.body && req.body.currencyId;
+  const rawBalance = req.body && req.body.balance;
+  if (rawCurrencyId === '' || rawCurrencyId == null || rawBalance === '' || rawBalance == null) {
+    return res.status(400).json({ error: 'currencyId and balance are required' });
+  }
+
+  let currencyId;
+  let balance;
+  try {
+    currencyId = boundedInteger(rawCurrencyId, 'Currency ID', 0, 1);
+    if (currencyId !== 0 && currencyId !== 1) throw new Error('Currency ID must be 0 or 1.');
+    balance = boundedInteger(rawBalance, 'Balance', 0, MAX_CURRENCY_BALANCE);
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
 
   try {
-    const pawnRow = await runPsql(ip,
-      `SELECT player_controller_id FROM encrypted_player_state WHERE player_pawn_id = ${id}`
-    );
-    const controllerId = parseInt(pawnRow.trim());
+    await requireStoppedOfflineCharacter(ip, id);
+    const backup = await backupBeforeCharacterMutation(ip);
+    const player = await requireStoppedOfflineCharacter(ip, id);
+    const controllerId = player.controllerId;
 
-    await runPsql(ip,
+    const raw = await runPsql(ip,
+      `BEGIN; ` +
+      `SET LOCAL search_path TO dune, public; ` +
+      offlineCharacterGuardSql(id) +
+      `DO $currency_guard$ BEGIN ` +
+      `IF NOT EXISTS (SELECT 1 FROM player_state WHERE player_pawn_id = ${id} ` +
+      `AND player_controller_id = ${controllerId}) THEN ` +
+      `RAISE EXCEPTION 'Player controller changed during currency update'; END IF; ` +
+      `END $currency_guard$; ` +
+      `SELECT balance FROM player_virtual_currency_balances ` +
+      `WHERE player_controller_id = ${controllerId} AND currency_id = ${currencyId} FOR UPDATE; ` +
       `INSERT INTO player_virtual_currency_balances (player_controller_id, currency_id, balance) ` +
-      `VALUES (${controllerId}, ${parseInt(currencyId)}, ${parseInt(balance)}) ` +
-      `ON CONFLICT (player_controller_id, currency_id) DO UPDATE SET balance = EXCLUDED.balance`
+      `VALUES (${controllerId}, ${currencyId}, ${balance}) ` +
+      `ON CONFLICT (player_controller_id, currency_id) DO UPDATE SET balance = EXCLUDED.balance; ` +
+      `DO $currency_verify$ BEGIN ` +
+      `IF NOT EXISTS (SELECT 1 FROM player_virtual_currency_balances ` +
+      `WHERE player_controller_id = ${controllerId} AND currency_id = ${currencyId} ` +
+      `AND balance = ${balance}) THEN RAISE EXCEPTION 'Currency balance verification failed'; END IF; ` +
+      `END $currency_verify$; ` +
+      `SELECT json_build_object('currencyId', currency_id, 'balance', balance)::text ` +
+      `FROM player_virtual_currency_balances WHERE player_controller_id = ${controllerId} ` +
+      `AND currency_id = ${currencyId}; ` +
+      `COMMIT;`
     );
-    log(`Currency ${currencyId} set to ${balance} for character ${id}.\n`);
-    res.json({ success: true });
+    const line = raw.trim().split(/\r?\n/).find((value) => value.trim().startsWith('{'));
+    if (!line) throw new Error('Currency update committed but verified readback was unavailable.');
+    const verified = JSON.parse(line);
+    if (Number(verified.currencyId) !== currencyId || Number(verified.balance) !== balance) {
+      throw new Error('Currency readback did not match the requested balance.');
+    }
+
+    log(`Currency ${currencyId} set to ${balance} for character ${id} (controller ${controllerId}).\n`);
+    res.json({ success: true, currencyId, balance, controllerId, backup });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    const message = e.message || 'Currency update failed';
+    const statusCode = /not confirmed fully stopped|fully logged out|must be Offline/i.test(message)
+      ? 409
+      : (/not found/i.test(message) ? 404 : 500);
+    res.status(statusCode).json({ error: message });
   }
 });
 
@@ -1925,6 +3223,6 @@ app.get('*', (_req, res) => {
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
-server.listen(PORT, () => {
-  console.log(`Dune Server Manager running at http://localhost:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`Dune Server Manager running at http://${HOST}:${PORT}`);
 });

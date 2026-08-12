@@ -1,3 +1,4 @@
 tools/**/bin/
 tools/**/obj/
 tools/Cue4ParsePatents/*.txt
+node_modules/

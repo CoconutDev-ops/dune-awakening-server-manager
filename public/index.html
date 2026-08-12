@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Dune: Awakening — Server Manager</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Readex+Pro:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
@@ -32,21 +32,39 @@
 
   <!-- Tabs -->
   <nav class="tabs">
-    <button class="tab active" data-tab="dashboard">Dashboard</button>
-    <button class="tab" data-tab="setup">Setup</button>
-    <button class="tab" data-tab="battlegroup">Battlegroup</button>
-    <button class="tab" data-tab="monitoring">Monitoring</button>
-    <button class="tab" data-tab="database">Database</button>
-    <button class="tab" data-tab="characters">Characters</button>
-    <button class="tab" data-tab="gameconfig">Game Config</button>
-    <button class="tab" data-tab="settings">Settings</button>
-    <button class="tab" data-tab="experimental">Experimental</button>
+    <span class="tabs-label">Overview</span>
+    <button class="tab active" data-tab="dashboard"><span class="tab-marker"></span>Dashboard</button>
+    <span class="tabs-label" id="setup-nav-label">Provisioning</span>
+    <button class="tab" id="setup-nav-tab" data-tab="setup"><span class="tab-marker"></span>Setup</button>
+    <span class="tabs-label">Operations</span>
+    <button class="tab" data-tab="battlegroup"><span class="tab-marker"></span>Battlegroup</button>
+    <button class="tab" data-tab="monitoring"><span class="tab-marker"></span>Monitoring</button>
+    <span class="tabs-label">Management</span>
+    <button class="tab" data-tab="database"><span class="tab-marker"></span>Database</button>
+    <button class="tab" data-tab="characters" id="characters-nav-tab" aria-controls="tab-characters" aria-expanded="false"><span class="tab-marker"></span>Characters</button>
+    <div class="character-subnav" id="character-subnav" aria-label="Character workspace" hidden>
+      <button type="button" class="character-subnav-item active" data-character-view="online" aria-controls="character-view-online" disabled>Online</button>
+      <button type="button" class="character-subnav-item character-subnav-parent" data-character-view="offline-stats" aria-controls="character-view-offline-stats" disabled>Offline</button>
+      <div class="character-subnav-nested" aria-label="Offline character tools">
+        <button type="button" class="character-subnav-item" data-character-view="offline-stats" aria-controls="character-view-offline-stats" disabled>Stats</button>
+        <button type="button" class="character-subnav-item" data-character-view="offline-inventory" aria-controls="character-view-offline-inventory" disabled>Inventory</button>
+        <button type="button" class="character-subnav-item" data-character-view="offline-cheats" aria-controls="character-view-offline-cheats" disabled>Cheats</button>
+      </div>
+    </div>
+    <button class="tab" data-tab="gameconfig"><span class="tab-marker"></span>Game Config</button>
+    <span class="tabs-label">System</span>
+    <button class="tab" data-tab="settings"><span class="tab-marker"></span>Settings</button>
+    <button class="tab" data-tab="experimental"><span class="tab-marker"></span>Experimental</button>
   </nav>
 
   <main class="content">
 
     <!-- ============ Dashboard ============ -->
     <section class="panel active" id="tab-dashboard">
+      <div class="page-heading">
+        <div><span class="eyebrow">Command centre</span><h2>Operations overview</h2><p>Live infrastructure health and the controls you use most.</p></div>
+        <button type="button" class="dashboard-setup-link" id="btn-show-setup" aria-label="Open server setup" hidden>Setup</button>
+      </div>
       <div class="card-row">
         <div class="card status-card" id="card-vm">
           <div class="card-header">
@@ -174,6 +192,10 @@
 
     <!-- ============ Setup Wizard ============ -->
     <section class="panel" id="tab-setup">
+      <div class="page-heading">
+        <div><span class="eyebrow">Provisioning</span><h2>Server setup</h2><p>Prepare the host, configure the VM, and bring your world online.</p></div>
+        <button type="button" class="btn btn-sm setup-dismiss-btn" id="btn-dismiss-setup">Dismiss setup</button>
+      </div>
       <div class="card wizard-card">
         <div class="card-header">
           <h2>Initial Server Setup</h2>
@@ -409,6 +431,9 @@
 
     <!-- ============ Battlegroup ============ -->
     <section class="panel" id="tab-battlegroup">
+      <div class="page-heading">
+        <div><span class="eyebrow">Operations</span><h2>Battlegroup</h2><p>Control the game services, updates, and memory allocation.</p></div>
+      </div>
       <div class="card">
         <div class="card-header"><h2>Battlegroup Controls</h2></div>
         <div class="card-body">
@@ -435,6 +460,9 @@
 
     <!-- ============ Monitoring ============ -->
     <section class="panel" id="tab-monitoring">
+      <div class="page-heading">
+        <div><span class="eyebrow">Observability</span><h2>Monitoring</h2><p>Open the tools used to inspect server health and activity.</p></div>
+      </div>
       <div class="card-row">
         <div class="card">
           <div class="card-header"><h2>Web Interfaces</h2></div>
@@ -462,6 +490,9 @@
 
     <!-- ============ Database ============ -->
     <section class="panel" id="tab-database">
+      <div class="page-heading">
+        <div><span class="eyebrow">Data safety</span><h2>Database</h2><p>Back up and restore persistent game data.</p></div>
+      </div>
       <div class="card">
         <div class="card-header"><h2>Database Management</h2></div>
         <div class="card-body">
@@ -482,24 +513,152 @@
 
     <!-- ============ Character Editor ============ -->
     <section class="panel" id="tab-characters">
-      <div class="char-warning">
-        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-        <span><strong>Editing characters directly modifies the game database.</strong> This may corrupt save data and cause total character loss. Always take a database backup before making changes. Only edit while the battlegroup is stopped and the player is logged out.</span>
+      <div class="page-heading">
+        <div><span class="eyebrow">Player management</span><h2>Character workspace</h2><p>Select one player, then work in a focused online or offline view.</p></div>
       </div>
 
-      <div class="card">
-        <div class="card-header"><h2>Select Character</h2></div>
-        <div class="card-body">
+      <div class="card character-selector-card">
+        <div class="card-body character-selector-body">
+          <div class="character-selector-copy">
+            <span class="character-selector-kicker">Active character</span>
+            <h3 id="character-selection-title">Choose a character to begin</h3>
+            <p>Selection stays in place while you move between live and offline tools.</p>
+          </div>
           <div class="char-select-row">
-            <select id="char-select" class="select-input" style="max-width:280px"><option value="">— Choose a character —</option></select>
+            <label class="sr-only" for="char-select">Character</label>
+            <select id="char-select" class="select-input"><option value="">— Choose a character —</option></select>
             <button class="btn btn-blue" id="btn-char-load">Load Character</button>
-            <button class="btn btn-blue" id="btn-char-refresh" title="Refresh character list">Refresh List</button>
+            <button class="btn character-refresh-btn" id="btn-char-refresh" title="Refresh character list" aria-label="Refresh character list">Refresh</button>
           </div>
         </div>
       </div>
 
       <div id="char-editor" style="display:none">
-        <div class="card">
+        <section class="character-view active" id="character-view-online" data-character-view-panel="online" aria-labelledby="character-online-heading">
+        <div class="card online-actions-card">
+          <div class="card-header character-view-intro online-view-intro">
+            <div>
+              <span class="eyebrow">Live game channel</span>
+              <h2 id="character-online-heading">Online</h2>
+              <p>Use the running game's admin channel for the selected player, then confirm the result in-game.</p>
+            </div>
+            <span class="badge" id="online-character-status">Checking status</span>
+          </div>
+          <div class="card-body">
+            <p class="card-desc">These actions are sent through the running game's own admin channel. The character must be fully online. A successful message means the game accepted it into its queue; check in-game to confirm it was applied.</p>
+
+            <div class="online-action-grid">
+            <div class="online-action-section character-action-surface">
+              <h3>Experience</h3>
+              <div class="config-grid">
+                <div class="config-item">
+                  <label>XP Category</label>
+                  <select class="select-input" id="online-xp-category">
+                    <option value="Combat">Combat</option>
+                    <option value="Exploration">Exploration</option>
+                    <option value="Science">Science</option>
+                  </select>
+                </div>
+                <div class="config-item">
+                  <label>XP to Add</label>
+                  <div class="input-with-unit">
+                    <input type="number" class="select-input" id="online-xp-amount" min="1" max="10000000" step="1000" value="10000">
+                    <button class="btn btn-green btn-sm online-action-btn" data-online-action="award-xp">Add XP</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="online-action-section character-action-surface online-training-card">
+              <h3>Training</h3>
+              <div class="config-grid">
+                <div class="config-item">
+                  <label>Unspent Skill Points</label>
+                  <div class="input-with-unit">
+                    <input type="number" class="select-input" id="online-skill-points" min="0" max="100000" step="1" value="104">
+                    <button class="btn btn-green btn-sm online-action-btn" data-online-action="set-skill-points">Set Points</button>
+                  </div>
+                </div>
+                <div class="config-item">
+                  <label>Reviewed Bulk Training</label>
+                  <div class="input-with-unit">
+                    <select class="select-input" id="online-bulk-training-action"><option value="">Loading...</option></select>
+                    <button class="btn btn-green btn-sm online-action-btn" data-online-action="run-training-batch">Run</button>
+                  </div>
+                </div>
+                <div class="config-item online-module-picker">
+                  <label>Individual Skill or Ability</label>
+                  <select class="select-input" id="online-skill-module"><option value="">Loading...</option></select>
+                </div>
+                <div class="config-item">
+                  <label>Module Level</label>
+                  <div class="input-with-unit">
+                    <input type="number" class="select-input" id="online-skill-level" min="0" max="1" step="1" value="1">
+                    <button class="btn btn-green btn-sm online-action-btn" data-online-action="set-skill-module">Set Level</button>
+                  </div>
+                </div>
+              </div>
+              <p class="field-hint">Bulk choices expand into a fixed reviewed list of native XP or module-level commands, paced about 300 ms apart. Hidden modules and the unwanted VoiceStop ability are excluded.</p>
+            </div>
+
+            <div class="online-action-section character-action-surface online-item-card">
+              <h3>Give Item</h3>
+              <div class="config-grid online-item-grid">
+                <div class="config-item online-item-picker">
+                  <label>Item</label>
+                  <input type="text" class="select-input" id="online-item-template" list="online-item-templates" placeholder="Search the reviewed item catalog">
+                  <datalist id="online-item-templates"></datalist>
+                </div>
+                <div class="config-item">
+                  <label>Quantity</label>
+                  <input type="number" class="select-input" id="online-item-count" min="1" max="1000" step="1" value="1">
+                </div>
+                <div class="config-item">
+                  <label>Durability <span class="field-hint-inline">0.01–1.00</span></label>
+                  <input type="number" class="select-input" id="online-item-durability" min="0.01" max="1" step="0.01" value="1">
+                </div>
+                <div class="config-item online-action-submit">
+                  <label>&nbsp;</label>
+                  <button class="btn btn-green online-action-btn" data-online-action="give-item">Give Item</button>
+                </div>
+              </div>
+              <p class="field-hint">The picker contains 105 metadata-confirmed augment templates plus 22 clearly marked package-only candidates from the current 1.4 client. Individual augment grants are fixed to one per click. Package-only IDs require an additional warning and may be ignored by the game; guarded offline Backpack creation remains limited to three reviewed shapes.</p>
+              <div class="bulk-augment-grant">
+                <button class="btn btn-green online-action-btn" id="btn-online-grant-all-augments" data-online-action="grant-all-confirmed-augments">Give 1 of Every Confirmed Augment</button>
+                <p class="field-hint">Queues one native item grant for each of the 105 metadata-confirmed augments, paced about 300 ms apart. The 22 package-only experimental candidates are excluded and remain available individually with their warning. Make plenty of inventory space; the game may place overflow near the character.</p>
+              </div>
+            </div>
+
+            <div class="online-action-section online-solari-section character-action-surface">
+              <h3>Carried Solari</h3>
+              <p class="card-desc">This queues <code>SolarisCoin</code> through the same live game channel as item grants. Broker acceptance does not prove the game applied it, so check the character's inventory or nearby ground in-game. The separate Economy editor below changes the saved wallet balance and still requires the character offline.</p>
+              <div class="config-grid">
+                <div class="config-item">
+                  <label>Carried Solari to Give</label>
+                  <div class="input-with-unit">
+                    <input type="number" class="select-input" id="online-solari-amount" min="1" max="1000000000" step="1000" value="100000">
+                    <button class="btn btn-green btn-sm online-action-btn" data-online-action="grant-solari">Give Solari</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            </div>
+
+            <div class="online-action-result character-view-result" id="online-action-result" role="status" aria-live="polite">Select an action when the character is in-game.</div>
+          </div>
+        </div>
+        </section>
+
+        <section class="character-view" id="character-view-offline-stats" data-character-view-panel="offline-stats" aria-labelledby="character-stats-heading" hidden>
+          <div class="character-view-intro">
+            <div><span class="eyebrow">Saved character data</span><h2 id="character-stats-heading">Offline · Stats</h2><p>Progression, identity, economy, faction standing, and appearance in one structured workspace.</p></div>
+          </div>
+          <div class="char-warning character-view-warning">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            <span><strong>Offline editing requires the battlegroup stopped and the player logged out.</strong> Guarded mutations create a safety backup; relog after changes.</span>
+          </div>
+
+        <div class="card character-tool-card character-stats-card">
           <div class="card-header"><h2>Stats</h2><button class="btn btn-green btn-sm" id="btn-stats-save">Save Stats</button></div>
           <div class="card-body">
             <div class="config-grid">
@@ -539,28 +698,14 @@
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-header">
-            <h2>Inventory</h2>
-            <span class="badge" id="inv-count">0 items</span>
-          </div>
-          <div class="card-body" style="padding:0">
-            <div class="inv-table-wrap">
-              <table class="inv-table" id="inv-table">
-                <thead><tr><th>Item</th><th>ID</th><th>Qty</th><th>Location</th><th></th></tr></thead>
-                <tbody id="inv-tbody"></tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-
-        <div class="card">
+        <div class="card character-tool-card" id="character-cheats-card">
           <div class="card-header"><h2>Add Item</h2></div>
           <div class="card-body">
             <div class="item-search-row">
               <input type="text" class="select-input" id="item-search" placeholder="Search items by name..." style="flex:1">
               <select class="select-input" id="item-cat-filter" style="max-width:200px">
                 <option value="">All Categories</option>
+                <option value="Augments">Augments</option>
                 <option value="Resources">Resources</option>
                 <option value="Consumables">Consumables</option>
                 <option value="Ammo">Ammo</option>
@@ -581,14 +726,14 @@
                 <tbody id="item-results-body"></tbody>
               </table>
             </div>
-            <p class="card-desc" id="item-results-hint" style="margin-top:.5rem">Type at least 2 characters to search by name or template ID across 1000 items.</p>
+            <p class="card-desc" id="item-results-hint" style="margin-top:.5rem">Type at least 2 characters to search by name or template ID across 1,127 reviewed and experimental entries, or choose a category. Online Actions contains 105 metadata-confirmed augments plus 22 current-package-only candidates; the three augments with reviewed database shapes also support guarded offline Backpack creation.</p>
           </div>
         </div>
 
-        <div class="card">
+        <div class="card character-tool-card character-tech-card">
           <div class="card-header"><h2>Tech Tree</h2><span class="badge" id="tech-count">—</span></div>
           <div class="card-body">
-            <p class="card-desc">Unlock or lock all recipes and blueprints in the tech knowledge tree. Unlock All merges every game recipe node into your save (not just ones already discovered). Stop the battlegroup and relog after changes.</p>
+            <p class="card-desc">Unlock the valid recipes and blueprints already created by the game for this character. This deliberately avoids injecting guessed pak-file nodes, which can make the game discard known recipes. A safety backup is created automatically. Stop the battlegroup and relog after changes.</p>
             <div class="btn-group">
               <button class="btn btn-green" id="btn-tech-unlock-all">Unlock All Recipes</button>
               <button class="btn btn-red" id="btn-tech-lock-all">Lock All Recipes</button>
@@ -596,11 +741,14 @@
           </div>
         </div>
 
-        <div class="card">
+        <div class="card character-tool-card character-specializations-card">
           <div class="card-header"><h2>Specializations</h2></div>
           <div class="card-body">
-            <p class="card-desc">Set XP and level for each specialization track, and unlock all keystones (perks) per tree.</p>
+            <p class="card-desc">Set XP and level for each specialization track, or safely max every track to level 100 / 44,182 XP and unlock all keystones. Changes use the player-controller record required by the game.</p>
             <div id="spec-tracks-grid" class="config-grid" style="margin-bottom:1rem"></div>
+            <div class="btn-group" style="margin-bottom:1rem">
+              <button class="btn btn-green" id="btn-spec-max-all">Max All Tracks &amp; Keystones</button>
+            </div>
             <h3 style="font-size:.8rem;color:var(--text-dim);margin-bottom:.5rem;text-transform:uppercase;letter-spacing:.05em">Unlock Keystones (Perks)</h3>
             <div class="btn-group" id="spec-keystone-btns">
               <button class="btn btn-green btn-sm" data-prefix="Combat_">All Combat</button>
@@ -612,21 +760,21 @@
           </div>
         </div>
 
-        <div class="card">
+        <div class="card character-tool-card character-economy-card">
           <div class="card-header"><h2>Economy</h2></div>
           <div class="card-body">
             <div class="config-grid">
               <div class="config-item">
                 <label>Solari (Currency 0)</label>
                 <div class="input-with-unit">
-                  <input type="number" class="select-input" id="econ-currency-0" min="0" step="1000" value="0">
+                  <input type="number" class="select-input" id="econ-currency-0" min="0" max="1000000000" step="1000" value="0">
                   <button class="btn btn-green btn-sm" data-currency="0">Set</button>
                 </div>
               </div>
               <div class="config-item">
                 <label>House Scrip (Currency 1)</label>
                 <div class="input-with-unit">
-                  <input type="number" class="select-input" id="econ-currency-1" min="0" step="100" value="0">
+                  <input type="number" class="select-input" id="econ-currency-1" min="0" max="1000000000" step="100" value="0">
                   <button class="btn btn-green btn-sm" data-currency="1">Set</button>
                 </div>
               </div>
@@ -634,33 +782,28 @@
           </div>
         </div>
 
-        <div class="card">
+        <div class="card character-tool-card character-faction-card">
           <div class="card-header"><h2>Faction Reputation</h2></div>
           <div class="card-body">
             <div class="config-grid" id="faction-rep-grid"></div>
           </div>
         </div>
 
-        <div class="card">
+        <div class="card character-tool-card character-cosmetics-card">
           <div class="card-header"><h2>Cosmetics &amp; Skins</h2><span class="badge" id="cosmetic-count">—</span></div>
           <div class="card-body">
-            <p class="card-desc">Search and unlock cosmetics by name. <strong>Vehicle Paints</strong> and <strong>Vehicle Variants</strong> are what show in the garage paint menu — not Swatch Tokens (those are inventory items; use Add Item instead).</p>
+            <p class="card-desc">Search 391 customization IDs observed in real persisted player data. Inventory-only Swatch tokens are excluded because they are items, not cosmetic-library unlocks. Bulk unlock creates a safety backup and preserves existing entries.</p>
             <div class="btn-group" style="margin-bottom:.75rem">
-              <button class="btn btn-green btn-sm" id="btn-cosmetic-unlock-all">Unlock All Cosmetics &amp; Swatches</button>
+              <button class="btn btn-green btn-sm" id="btn-cosmetic-unlock-all">Unlock All Reviewed Cosmetics</button>
             </div>
             <div class="item-search-row" style="margin-bottom:.5rem">
               <input type="text" class="select-input" id="cosmetic-search" placeholder="Search cosmetics by name or ID..." style="flex:1">
               <select class="select-input" id="cosmetic-cat-filter" style="max-width:200px">
                 <option value="">All Categories</option>
-                <option value="Vehicle Paints">Vehicle Paints</option>
-                <option value="Vehicle Variants">Vehicle Variants</option>
                 <option value="Vehicle Skins">Vehicle Skins (MTX)</option>
                 <option value="Weapon Skins">Weapon Skins</option>
-                <option value="Weapon Paints">Weapon Paints</option>
                 <option value="Armor Skins">Armor Skins</option>
-                <option value="Armor Paints">Armor Paints</option>
                 <option value="Dye Packs">Dye Packs</option>
-                <option value="Swatch Tokens (Inventory)">Swatch Tokens (Inventory)</option>
               </select>
             </div>
             <div class="item-results-wrap" id="cosmetic-results" style="display:none;margin-bottom:.75rem">
@@ -669,7 +812,7 @@
                 <tbody id="cosmetic-results-body"></tbody>
               </table>
             </div>
-            <p class="card-desc" id="cosmetic-results-hint" style="margin-bottom:.75rem">Type at least 2 characters to search across 621 cosmetics, or pick a category filter.</p>
+            <p class="card-desc" id="cosmetic-results-hint" style="margin-bottom:.75rem">Type at least 2 characters to search the reviewed cosmetic catalog, or pick a category filter.</p>
             <details>
               <summary style="cursor:pointer;color:var(--text-dim);font-size:.8rem">Advanced: add by exact ID</summary>
               <div class="item-search-row" style="margin-top:.5rem">
@@ -679,11 +822,62 @@
             </details>
           </div>
         </div>
+        </section>
+
+        <section class="character-view" id="character-view-offline-inventory" data-character-view-panel="offline-inventory" aria-labelledby="character-inventory-heading" hidden>
+          <div class="character-view-intro">
+            <div><span class="eyebrow">Owned items</span><h2 id="character-inventory-heading">Offline · Inventory</h2><p>Review item locations and quantities, then manage supported standalone augment rolls.</p></div>
+          </div>
+          <div class="char-warning character-view-warning">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            <span><strong>Inventory edits require the battlegroup stopped and the player logged out.</strong> Confirm ownership and location before removing or altering items.</span>
+          </div>
+          <div class="character-view-mount" id="character-inventory-mount">
+            <div class="card character-tool-card" id="character-inventory-card">
+              <div class="card-header">
+                <h2>Inventory</h2>
+                <span class="badge" id="inv-count">0 items</span>
+              </div>
+              <div class="card-body" style="padding:0">
+                <div class="inv-table-wrap">
+                  <table class="inv-table" id="inv-table">
+                    <thead><tr><th>Item</th><th>ID</th><th>Qty</th><th>Grade</th><th>Location</th><th></th></tr></thead>
+                    <tbody id="inv-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+            <div class="card character-tool-card" id="character-augment-card">
+              <div class="card-header"><h2>Augment Attributes</h2></div>
+              <div class="card-body">
+                <p class="card-desc">Set every positive numeric roll on supported standalone augment items to <code>1.003398</code> and Grade 5. Augments installed into equipment use a different data structure and are not changed.</p>
+                <div class="btn-group">
+                  <button class="btn btn-green" id="btn-augment-max-all">Max All Supported Augments + Grade 5</button>
+                </div>
+                <div class="online-action-result" id="augment-max-result">No augment changes made.</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="character-view" id="character-view-offline-cheats" data-character-view-panel="offline-cheats" aria-labelledby="character-cheats-heading" hidden>
+          <div class="character-view-intro">
+            <div><span class="eyebrow">Offline utility</span><h2 id="character-cheats-heading">Offline · Cheats</h2><p>Add a reviewed item directly to a writable inventory while the character is safely offline.</p></div>
+          </div>
+          <div class="char-warning character-view-warning">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            <span><strong>Add Item writes directly to saved data.</strong> Stop the battlegroup, keep the player logged out, and use reviewed catalog entries.</span>
+          </div>
+          <div class="character-view-mount" id="character-cheats-mount"></div>
+        </section>
       </div>
     </section>
 
     <!-- ============ Game Config ============ -->
     <section class="panel" id="tab-gameconfig">
+      <div class="page-heading">
+        <div><span class="eyebrow">World rules</span><h2>Game configuration</h2><p>Review and tune gameplay, environment, and server settings.</p></div>
+      </div>
       <div class="config-header-row">
         <h2 class="section-title">Game Configuration</h2>
         <div class="config-actions">
@@ -899,6 +1093,9 @@
 
     <!-- ============ Settings ============ -->
     <section class="panel" id="tab-settings">
+      <div class="page-heading">
+        <div><span class="eyebrow">System</span><h2>Settings</h2><p>Manage credentials and secure access to the virtual machine.</p></div>
+      </div>
       <div class="card-row">
         <div class="card">
           <div class="card-header"><h2>Change VM Password</h2></div>
@@ -932,6 +1129,9 @@
 
     <!-- ============ Experimental ============ -->
     <section class="panel" id="tab-experimental">
+      <div class="page-heading">
+        <div><span class="eyebrow">Use with care</span><h2>Experimental</h2><p>Preview advanced capabilities that may still change.</p></div>
+      </div>
       <div class="card-row">
         <div class="card" style="border-left:3px solid var(--warn)">
           <div class="card-header"><h2>Experimental Features</h2></div>
@@ -988,10 +1188,40 @@
     </div>
   </div>
 
-  <!-- Loading overlay -->
-  <div class="overlay" id="overlay" hidden>
-    <div class="spinner"></div>
-    <p class="overlay-text" id="overlay-text">Working...</p>
+  <!-- Full-screen operation console. Kept outside the application shell so the
+       rest of the interface can be made inert while an action is running. -->
+  <div class="overlay" id="overlay" role="dialog" aria-modal="true" aria-labelledby="overlay-text" aria-describedby="operation-lock-note" tabindex="-1" hidden>
+    <div class="operation-shell">
+      <header class="operation-header">
+        <div class="operation-heading">
+          <span class="eyebrow">Live operation</span>
+          <h2 class="operation-title" id="overlay-text">Working...</h2>
+          <p class="operation-lock-note" id="operation-lock-note">Controls are temporarily locked until this operation finishes.</p>
+        </div>
+        <div class="operation-state" role="status">
+          <span class="operation-state-dot" aria-hidden="true"></span>
+          <span>In progress</span>
+        </div>
+      </header>
+
+      <section class="operation-terminal" aria-label="Live server console">
+        <div class="operation-terminal-bar">
+          <div class="operation-terminal-label">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+            Server output
+          </div>
+          <span class="operation-live-label"><span aria-hidden="true"></span>Live</span>
+        </div>
+        <div class="operation-console-scroll" id="operation-console-scroll">
+          <pre id="operation-console-output" aria-live="polite" aria-atomic="false"></pre>
+        </div>
+      </section>
+
+      <footer class="operation-footer">
+        <span>This view will close automatically when the operation completes.</span>
+        <span>Keep this window open.</span>
+      </footer>
+    </div>
   </div>
 
   <script src="/js/app.js"></script>
