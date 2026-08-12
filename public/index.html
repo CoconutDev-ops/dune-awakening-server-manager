@@ -61,11 +61,11 @@
 
     <!-- ============ Dashboard ============ -->
     <section class="panel active" id="tab-dashboard">
-      <div class="page-heading">
-        <div><span class="eyebrow">Command centre</span><h2>Operations overview</h2><p>Live infrastructure health and the controls you use most.</p></div>
+      <div class="page-heading dashboard-heading">
+        <div><span class="eyebrow">Command centre</span><h2>Battlegroup overview</h2><p>See what every game server is doing and manage the battlegroup from one place.</p></div>
         <button type="button" class="dashboard-setup-link" id="btn-show-setup" aria-label="Open server setup" hidden>Setup</button>
       </div>
-      <div class="card-row">
+      <div class="dashboard-stack">
         <div class="card status-card" id="card-vm">
           <div class="card-header">
             <h2>Virtual Machine</h2>
@@ -105,15 +105,45 @@
           </div>
         </div>
 
-        <div class="card status-card" id="card-bg">
-          <div class="card-header">
-            <h2>Battlegroup</h2>
-            <span class="badge" id="bg-badge">Unknown</span>
+        <div class="card status-card dashboard-bg-card" id="card-bg">
+          <div class="dashboard-bg-hero">
+            <div class="dashboard-bg-identity">
+              <span class="dashboard-state-mark" id="bg-state-mark" aria-hidden="true"></span>
+              <div>
+                <span class="dashboard-kicker" id="bg-name">Battlegroup</span>
+                <h3 id="bg-state-title">Checking battlegroup</h3>
+                <p id="bg-state-description">Waiting for the latest status from the server.</p>
+              </div>
+            </div>
+            <span class="badge" id="bg-badge" role="status" aria-live="polite">Unknown</span>
           </div>
-          <div class="card-body">
-            <pre class="bg-status-output" id="bg-status-text">Waiting for status...</pre>
+          <div class="dashboard-bg-body">
+            <div class="dashboard-summary-grid" aria-label="Battlegroup health summary">
+              <div class="dashboard-summary-item"><span class="dashboard-summary-label">Gateway</span><span class="dashboard-summary-value" id="bg-gateway">—</span></div>
+              <div class="dashboard-summary-item"><span class="dashboard-summary-label">Database</span><span class="dashboard-summary-value" id="bg-database">—</span></div>
+              <div class="dashboard-summary-item"><span class="dashboard-summary-label">Director</span><span class="dashboard-summary-value" id="bg-director">—</span></div>
+              <div class="dashboard-summary-item"><span class="dashboard-summary-label">Health</span><span class="dashboard-summary-value" id="bg-health">—</span></div>
+              <div class="dashboard-summary-item dashboard-summary-emphasis"><span class="dashboard-summary-label">Players online</span><span class="dashboard-summary-value" id="bg-players">0</span></div>
+              <div class="dashboard-summary-item dashboard-summary-emphasis"><span class="dashboard-summary-label">Servers ready</span><span class="dashboard-summary-value" id="bg-ready-servers">0 / 0</span></div>
+            </div>
+            <section class="dashboard-servers" aria-labelledby="dashboard-servers-title">
+              <div class="dashboard-section-heading">
+                <div><span class="dashboard-kicker">Live activity</span><h3 id="dashboard-servers-title">Game servers</h3></div>
+                <span class="dashboard-last-update" id="bg-server-count">No server data</span>
+              </div>
+              <div class="dashboard-server-table-wrap">
+                <table class="dashboard-server-table">
+                  <thead><tr><th scope="col">Map</th><th scope="col">Phase</th><th scope="col">Ready</th><th scope="col">Players</th><th scope="col">Age</th></tr></thead>
+                  <tbody id="bg-server-rows"><tr class="dashboard-empty-row"><td colspan="5">Waiting for server status…</td></tr></tbody>
+                </table>
+              </div>
+            </section>
+            <details class="dashboard-diagnostics">
+              <summary>Raw status and diagnostics</summary>
+              <pre class="bg-status-output" id="bg-status-text">Waiting for status...</pre>
+            </details>
           </div>
-          <div class="card-actions">
+          <div class="card-actions dashboard-primary-actions" aria-label="Battlegroup controls">
             <button class="btn btn-green" id="btn-bg-start" disabled>Start</button>
             <button class="btn btn-yellow" id="btn-bg-restart" disabled>Restart</button>
             <button class="btn btn-red" id="btn-bg-stop" disabled>Stop</button>
@@ -175,19 +205,6 @@
         </div>
       </div>
 
-      <div class="card quick-links-card" id="quick-links">
-        <div class="card-header"><h2>Quick Links</h2></div>
-        <div class="card-body link-row">
-          <a class="link-btn" id="link-filebrowser" href="#" target="_blank">
-            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>
-            File Browser
-          </a>
-          <a class="link-btn" id="link-director" href="#" target="_blank">
-            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
-            Director
-          </a>
-        </div>
-      </div>
     </section>
 
     <!-- ============ Setup Wizard ============ -->
@@ -461,9 +478,36 @@
     <!-- ============ Monitoring ============ -->
     <section class="panel" id="tab-monitoring">
       <div class="page-heading">
-        <div><span class="eyebrow">Observability</span><h2>Monitoring</h2><p>Open the tools used to inspect server health and activity.</p></div>
+        <div><span class="eyebrow">Observability</span><h2>Monitoring</h2><p>Follow manager activity as it happens, then open supporting tools when you need a deeper view.</p></div>
       </div>
-      <div class="card-row">
+
+      <section class="monitoring-live-card" aria-labelledby="monitoring-log-title" aria-describedby="monitoring-session-scope">
+        <header class="monitoring-log-header">
+          <div class="monitoring-log-heading">
+            <span class="monitoring-log-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+            </span>
+            <div>
+              <span class="eyebrow">Current session</span>
+              <h3 id="monitoring-log-title">Live manager log</h3>
+            </div>
+          </div>
+          <span class="monitoring-live-state is-connecting" id="monitoring-live-state" role="status">
+            <span class="monitoring-live-dot" aria-hidden="true"></span>
+            <span id="monitoring-live-text">Connecting</span>
+          </span>
+        </header>
+        <p class="monitoring-session-scope" id="monitoring-session-scope">Commands, manager messages and server output appear here for as long as this admin page remains open. Use Log Export below for historical logs.</p>
+        <div class="monitoring-log-scroll" id="monitoring-log-scroll" tabindex="0" aria-label="Scrollable live manager log">
+          <pre id="console-output" role="log" aria-live="polite" aria-atomic="false" aria-relevant="additions text"></pre>
+        </div>
+      </section>
+
+      <div class="monitoring-secondary-heading">
+        <span class="eyebrow">Supporting tools</span>
+        <p>Open a specialist interface or download logs for later analysis.</p>
+      </div>
+      <div class="card-row monitoring-secondary-grid">
         <div class="card">
           <div class="card-header"><h2>Web Interfaces</h2></div>
           <div class="card-body">
@@ -1175,18 +1219,6 @@
       </div>
     </section>
   </main>
-
-  <!-- Console -->
-  <div class="console-wrapper" id="console-wrapper">
-    <button class="console-toggle" id="console-toggle">
-      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-      Console Output
-      <span class="console-badge" id="console-badge" hidden>new</span>
-    </button>
-    <div class="console-body" id="console-body">
-      <pre id="console-output"></pre>
-    </div>
-  </div>
 
   <!-- Full-screen operation console. Kept outside the application shell so the
        rest of the interface can be made inert while an action is running. -->

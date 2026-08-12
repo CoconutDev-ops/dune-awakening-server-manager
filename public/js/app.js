@@ -14,16 +14,26 @@
   const vmMemory      = $('#vm-memory');
   const vmUptime      = $('#vm-uptime');
   const bgStatusText  = $('#bg-status-text');
+  const bgName        = $('#bg-name');
+  const bgStateTitle  = $('#bg-state-title');
+  const bgStateDescription = $('#bg-state-description');
+  const bgStateMark   = $('#bg-state-mark');
+  const bgGateway     = $('#bg-gateway');
+  const bgDatabase    = $('#bg-database');
+  const bgDirector    = $('#bg-director');
+  const bgHealth      = $('#bg-health');
+  const bgPlayers     = $('#bg-players');
+  const bgReadyServers = $('#bg-ready-servers');
+  const bgServerCount = $('#bg-server-count');
+  const bgServerRows  = $('#bg-server-rows');
   const consoleOut    = $('#console-output');
-  const consoleToggle = $('#console-toggle');
-  const consoleWrap   = $('#console-wrapper');
-  const consoleBadge  = $('#console-badge');
+  const consoleScroll = $('#monitoring-log-scroll');
+  const monitoringLiveState = $('#monitoring-live-state');
+  const monitoringLiveText = $('#monitoring-live-text');
   const overlay       = $('#overlay');
   const overlayText   = $('#overlay-text');
   const operationConsoleOut = $('#operation-console-output');
   const operationConsoleScroll = $('#operation-console-scroll');
-  const linkFB        = $('#link-filebrowser');
-  const linkDir       = $('#link-director');
   const monFB         = $('#mon-filebrowser');
   const monDir        = $('#mon-director');
 
@@ -43,6 +53,9 @@
   const charactersNavTab = $('#characters-nav-tab');
   const characterSubnav = $('#character-subnav');
   const characterViewButtons = $$('.character-subnav-item');
+
+  // Match the visual hierarchy in the document reading order as well.
+  $('.dashboard-stack').prepend($('#card-bg'));
 
   // Keep the data-heavy tools in dedicated workspaces without changing any
   // action IDs or event targets used by the character editor below.
@@ -111,6 +124,11 @@
       const charactersActive = tab.dataset.tab === 'characters';
       characterSubnav.hidden = !charactersActive;
       charactersNavTab.setAttribute('aria-expanded', String(charactersActive));
+      if (tab.dataset.tab === 'monitoring') {
+        requestAnimationFrame(() => {
+          consoleScroll.scrollTop = consoleScroll.scrollHeight;
+        });
+      }
     });
   });
 
@@ -127,16 +145,9 @@
   // -----------------------------------------------------------------------
   // Console
   // -----------------------------------------------------------------------
-  consoleWrap.classList.add('collapsed');
-
-  consoleToggle.addEventListener('click', () => {
-    consoleWrap.classList.toggle('collapsed');
-    consoleBadge.hidden = true;
-  });
-
   function appendConsole(text) {
     consoleOut.textContent += text;
-    consoleOut.parentElement.scrollTop = consoleOut.parentElement.scrollHeight;
+    consoleScroll.scrollTop = consoleScroll.scrollHeight;
 
     // The full-screen operation console follows the same output stream as the
     // persistent console, but only retains output from the current operation.
@@ -148,15 +159,12 @@
       operationConsoleOut.textContent += text;
       operationConsoleScroll.scrollTop = operationConsoleScroll.scrollHeight;
     }
-
-    if (consoleWrap.classList.contains('collapsed')) {
-      consoleBadge.hidden = false;
-    }
   }
 
   function expandConsole() {
-    consoleWrap.classList.remove('collapsed');
-    consoleBadge.hidden = true;
+    // The session log is always expanded on Monitoring. Keep callers focused
+    // on their current task while ensuring the newest output is in view there.
+    consoleScroll.scrollTop = consoleScroll.scrollHeight;
   }
 
   // -----------------------------------------------------------------------
@@ -178,9 +186,16 @@
   // -----------------------------------------------------------------------
   let ws;
 
+  function setMonitoringConnectionState(state, label) {
+    monitoringLiveState.className = `monitoring-live-state is-${state}`;
+    monitoringLiveText.textContent = label;
+  }
+
   function connectWs() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    setMonitoringConnectionState('connecting', 'Connecting');
     ws = new WebSocket(`${proto}://${location.host}`);
+    ws.onopen = () => setMonitoringConnectionState('live', 'Live');
     ws.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data);
@@ -190,7 +205,10 @@
         }
       } catch { /* ignore */ }
     };
-    ws.onclose = () => setTimeout(connectWs, 3000);
+    ws.onclose = () => {
+      setMonitoringConnectionState('reconnecting', 'Reconnecting');
+      setTimeout(connectWs, 3000);
+    };
   }
   connectWs();
 
@@ -223,7 +241,7 @@
     return data;
   }
 
-  const operationLockTargets = [$('.topbar'), $('.tabs'), $('.content'), consoleWrap];
+  const operationLockTargets = [$('.topbar'), $('.tabs'), $('.content')].filter(Boolean);
   let operationPreviousFocus = null;
   let operationDepth = 0;
   let operationHasOutput = false;
@@ -307,6 +325,165 @@
   // -----------------------------------------------------------------------
   // Status refresh
   // -----------------------------------------------------------------------
+  function cleanBattlegroupOutput(raw) {
+    return String(raw || '')
+      .replace(/\u001b\[[0-?]*[ -\/]*[@-~]/g, '')
+      .replace(/\r/g, '')
+      .trim();
+  }
+
+  function splitStatusColumns(line) {
+    const spaced = line.trim().split(/\t+|\s{2,}/).filter(Boolean);
+    return spaced.length > 1 ? spaced : line.trim().split(/\s+/).filter(Boolean);
+  }
+
+  function parseBattlegroupStatus(raw) {
+    const output = cleanBattlegroupOutput(raw);
+    const parsed = {
+      name: '',
+      summary: { status: '', database: '', gateway: '', director: '', health: '' },
+      servers: [],
+      noResources: /No resources found/i.test(output),
+      recognized: false,
+    };
+    if (!output) return parsed;
+
+    const nameMatch = output.match(/^\s*Battlegroup:\s*(.+?)\s*$/mi);
+    if (nameMatch) parsed.name = nameMatch[1].trim();
+
+    const sections = output.split(/\bGame Servers\b/i);
+    const summaryLines = (sections[0] || '').split('\n');
+    const summaryHeader = summaryLines.findIndex((line) =>
+      /\bStatus\b/i.test(line) && /\bDatabase\b/i.test(line) && /\bGateway\b/i.test(line) && /\bDirector\b/i.test(line)
+    );
+    if (summaryHeader >= 0) {
+      const summaryRow = summaryLines.slice(summaryHeader + 1).find((line) =>
+        line.trim() && !/^\s*-+(?:\s+-+)+\s*$/.test(line)
+      );
+      if (summaryRow) {
+        const values = splitStatusColumns(summaryRow);
+        if (values.length >= 5) {
+          parsed.summary.health = values.pop() || '';
+          parsed.summary.director = values.pop() || '';
+          parsed.summary.gateway = values.pop() || '';
+          parsed.summary.database = values.pop() || '';
+          parsed.summary.status = values.join(' ');
+          parsed.recognized = true;
+        }
+      }
+    }
+
+    if (sections.length > 1) {
+      const serverLines = sections.slice(1).join('Game Servers').split('\n');
+      const serverHeader = serverLines.findIndex((line) =>
+        /\bMap\b/i.test(line) && /\bPhase\b/i.test(line) && /\bReady\b/i.test(line) && /\bPlayers\b/i.test(line)
+      );
+      if (serverHeader >= 0) {
+        const rows = serverLines.slice(serverHeader + 1)
+          .filter((line) => line.trim() && !/^\s*-+(?:\s+-+)+\s*$/.test(line) && !/No resources found/i.test(line));
+        rows.forEach((line) => {
+          const values = splitStatusColumns(line);
+          if (values.length < 5) return;
+          const age = values.pop() || '—';
+          const players = values.pop() || '0';
+          const ready = values.pop() || '';
+          const map = values.shift() || 'Unknown';
+          const phase = values.join(' ') || 'Unknown';
+          if (!/^(?:true|false)$/i.test(ready) || !/^\d+$/.test(players)) return;
+          parsed.servers.push({ map, phase, ready: /^true$/i.test(ready), players: Number(players), age });
+        });
+        parsed.recognized = parsed.recognized || parsed.servers.length > 0 || parsed.noResources;
+      }
+    }
+
+    return parsed;
+  }
+
+  function battlegroupPresentation(bg, vmRunning, parsed) {
+    if (!vmRunning) {
+      return { key: 'vm-off', badge: 'VM Off', title: 'Virtual machine offline', description: 'Start the VM to make the battlegroup and its game servers available.' };
+    }
+    if (!bg) {
+      return { key: 'unknown', badge: 'Unknown', title: 'Status unavailable', description: 'The manager has not received battlegroup status yet.' };
+    }
+    if (parsed.noResources || bg.needsBootstrap) {
+      return { key: 'attention', badge: 'Setup needed', title: 'Battlegroup setup incomplete', description: 'No game-server resources were found. Complete or repair setup before starting.' };
+    }
+    const phases = parsed.servers.map((server) => server.phase.toLowerCase());
+    const health = parsed.summary.health.toLowerCase();
+    if (health.includes('suspend') || phases.some((phase) => phase.includes('suspend'))) {
+      return { key: 'suspended', badge: 'Suspended', title: 'Battlegroup suspended', description: 'Game-server workloads are safely stopped and no players can connect.' };
+    }
+    if (phases.some((phase) => /startup|starting|pending|creating/.test(phase))) {
+      return { key: 'starting', badge: 'Starting', title: 'Game servers starting', description: 'Services are coming online. Readiness will update as each map becomes available.' };
+    }
+    if (bg.running) {
+      return { key: 'running', badge: 'Active', title: 'Battlegroup online', description: 'Game services are running. Live map activity is shown below.' };
+    }
+    if (!parsed.recognized && cleanBattlegroupOutput(bg.output)) {
+      return { key: 'unknown', badge: 'Unavailable', title: 'Detailed status unavailable', description: 'The response could not be structured. Open diagnostics below to inspect the original output.' };
+    }
+    return { key: 'inactive', badge: 'Inactive', title: 'Battlegroup inactive', description: 'The VM is available, but game-server workloads are not running.' };
+  }
+
+  function renderBattlegroupDashboard(bg, vmRunning) {
+    const rawOutput = bg && bg.output ? bg.output : '';
+    const parsed = parseBattlegroupStatus(rawOutput);
+    const view = battlegroupPresentation(bg, vmRunning, parsed);
+    const readyServers = parsed.servers.filter((server) => server.ready).length;
+    const totalPlayers = parsed.servers.reduce((total, server) => total + server.players, 0);
+
+    bgName.textContent = parsed.name ? `Battlegroup · ${parsed.name}` : 'Battlegroup';
+    bgStateTitle.textContent = view.title;
+    bgStateDescription.textContent = view.description;
+    bgStateMark.className = `dashboard-state-mark ${view.key}`;
+    $('#card-bg').dataset.state = view.key;
+    bgGateway.textContent = parsed.summary.gateway || '—';
+    bgDatabase.textContent = parsed.summary.database || '—';
+    bgDirector.textContent = parsed.summary.director || '—';
+    bgHealth.textContent = parsed.summary.health || (view.key === 'vm-off' ? 'Unavailable' : '—');
+    bgPlayers.textContent = String(totalPlayers);
+    bgReadyServers.textContent = `${readyServers} / ${parsed.servers.length}`;
+    bgServerCount.textContent = parsed.servers.length
+      ? `${parsed.servers.length} server${parsed.servers.length === 1 ? '' : 's'}`
+      : 'No active servers';
+
+    bgServerRows.replaceChildren();
+    if (parsed.servers.length) {
+      parsed.servers.forEach((server) => {
+        const row = document.createElement('tr');
+        const cells = [server.map, server.phase, server.ready ? 'Ready' : 'Not ready', String(server.players), server.age];
+        cells.forEach((value, index) => {
+          const cell = document.createElement('td');
+          cell.dataset.label = ['Map', 'Phase', 'Ready', 'Players', 'Age'][index];
+          if (index === 2) {
+            const indicator = document.createElement('span');
+            indicator.className = `dashboard-ready ${server.ready ? 'is-ready' : 'not-ready'}`;
+            indicator.textContent = value;
+            cell.append(indicator);
+          } else {
+            cell.textContent = value;
+          }
+          row.append(cell);
+        });
+        bgServerRows.append(row);
+      });
+    } else {
+      const row = document.createElement('tr');
+      row.className = 'dashboard-empty-row';
+      const cell = document.createElement('td');
+      cell.colSpan = 5;
+      cell.textContent = parsed.noResources
+        ? 'No game-server resources have been created yet.'
+        : vmRunning ? 'No active game servers reported.' : 'Game-server activity is unavailable while the VM is off.';
+      row.append(cell);
+      bgServerRows.append(row);
+    }
+
+    bgStatusText.textContent = rawOutput || (vmRunning ? 'No battlegroup details returned.' : 'VM not running');
+    return view;
+  }
+
   function applyStatus(s) {
     status = s;
     const vm = s.vm || {};
@@ -340,11 +517,11 @@
 
     // Battlegroup card
     const bgUp = bg && bg.running;
-    bgBadge.textContent = !running ? 'VM Off' : bgUp ? 'Active' : 'Inactive';
-    bgBadge.className   = `badge ${!running ? '' : bgUp ? 'running' : 'stopped'}`;
-    bgChip.className    = `status-chip ${!running ? 'unknown' : bgUp ? 'running' : 'stopped'}`;
-    $('#bg-chip-state').textContent = !running ? '—' : bgUp ? 'Active' : 'Inactive';
-    bgStatusText.textContent = bg ? bg.output || 'No details' : 'VM not running';
+    const bgView = renderBattlegroupDashboard(bg, running);
+    bgBadge.textContent = bgView.badge;
+    bgBadge.className   = `badge ${bgView.key}`;
+    bgChip.className    = `status-chip ${bgView.key}`;
+    $('#bg-chip-state').textContent = bgView.badge;
 
     const bgBtns = ['btn-bg-start', 'btn-bg-restart', 'btn-bg-stop', 'btn-bg-update'];
     bgBtns.forEach((id) => { $(`#${id}`).disabled = busy || !running; });
@@ -364,8 +541,6 @@
         el.setAttribute('data-nolink', '1');
       }
     }
-    setLink(linkFB, links.fileBrowser);
-    setLink(linkDir, links.director);
     setLink(monFB, links.fileBrowser);
     setLink(monDir, links.director);
 
